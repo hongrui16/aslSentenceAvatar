@@ -149,6 +149,129 @@ Total gloss folders: 3,186
 | ≥ 41                 | 0                  | 0            |
 
 
+## ASL3DWord vs WLASL: Per-Gloss Video Retention Analysis
+
+**Total glosses:** 103 | **Total ASL3DWord samples:** 1,539
+
+| Gloss | ASL3DWord | WLASL | Kept% |
+|:------|----------:|------:|------:|
+| deaf | 23 | 23 | 100% |
+| no | 22 | 22 | 100% |
+| drink | 22 | 35 | 63% |
+| now | 21 | 21 | 100% |
+| orange | 21 | 21 | 100% |
+| cousin | 21 | 23 | 91% |
+| bowling | 20 | 20 | 100% |
+| blue | 20 | 20 | 100% |
+| black | 20 | 21 | 95% |
+| hot | 20 | 21 | 95% |
+| woman | 20 | 21 | 95% |
+| study | 20 | 20 | 100% |
+| forget | 19 | 19 | 100% |
+| year | 19 | 22 | 86% |
+| graduate | 19 | 20 | 95% |
+| meet | 19 | 19 | 100% |
+| hearing | 19 | 20 | 95% |
+| help | 19 | 22 | 86% |
+| dance | 19 | 19 | 100% |
+| table | 19 | 21 | 90% |
+| can | 19 | 20 | 95% |
+| pull | 18 | 18 | 100% |
+| time | 18 | 19 | 95% |
+| man | 18 | 20 | 90% |
+| bird | 18 | 19 | 95% |
+| school | 18 | 19 | 95% |
+| son | 18 | 18 | 100% |
+| wrong | 18 | 20 | 90% |
+| yes | 18 | 22 | 82% |
+| wife | 18 | 18 | 100% |
+| work | 18 | 19 | 95% |
+| yellow | 18 | 18 | 100% |
+| who | 18 | 25 | 72% |
+| many | 18 | 21 | 86% |
+| basketball | 18 | 18 | 100% |
+| book | 18 | 40 | 45% |
+| need | 17 | 18 | 94% |
+| finish | 17 | 21 | 81% |
+| water | 17 | 18 | 94% |
+| color | 17 | 19 | 89% |
+| paper | 17 | 18 | 94% |
+| medicine | 17 | 18 | 94% |
+| fine | 17 | 22 | 77% |
+| apple | 17 | 19 | 89% |
+| hat | 17 | 20 | 85% |
+| go | 17 | 26 | 65% |
+| chair | 17 | 26 | 65% |
+| mother | 17 | 21 | 81% |
+| white | 17 | 20 | 85% |
+| walk | 17 | 22 | 77% |
+| like | 16 | 21 | 76% |
+| enjoy | 16 | 19 | 84% |
+| want | 16 | 19 | 84% |
+| eat | 16 | 19 | 84% |
+| brown | 15 | 18 | 83% |
+| jacket | 15 | 18 | 83% |
+| wait | 15 | 18 | 83% |
+| dog | 15 | 20 | 75% |
+| decide | 14 | 18 | 78% |
+| family | 14 | 20 | 70% |
+| change | 14 | 19 | 74% |
+| pink | 14 | 19 | 74% |
+| secretary | 14 | 19 | 74% |
+| candy | 14 | 24 | 58% |
+| purple | 13 | 18 | 72% |
+| but | 13 | 18 | 72% |
+| what | 13 | 21 | 62% |
+| doctor | 13 | 19 | 68% |
+| before | 13 | 26 | 50% |
+| play | 13 | 19 | 68% |
+| africa | 13 | 18 | 72% |
+| all | 13 | 21 | 62% |
+| dark | 13 | 19 | 68% |
+| kiss | 13 | 20 | 65% |
+| birthday | 12 | 18 | 67% |
+| letter | 12 | 18 | 67% |
+| cook | 12 | 18 | 67% |
+| visit | 11 | 18 | 61% |
+| thanksgiving | 11 | 21 | 52% |
+| last | 11 | 19 | 58% |
+| clothes | 11 | 25 | 44% |
+| fish | 11 | 20 | 55% |
+| corn | 11 | 19 | 58% |
+| language | 10 | 20 | 50% |
+| thin | 10 | 22 | 45% |
+| tell | 10 | 18 | 56% |
+| paint | 10 | 18 | 56% |
+| bed | 10 | 20 | 50% |
+| accident | 10 | 19 | 53% |
+| short | 10 | 19 | 53% |
+| thursday | 9 | 18 | 50% |
+| pizza | 9 | 19 | 47% |
+| give | 9 | 19 | 47% |
+| city | 9 | 18 | 50% |
+| cheat | 8 | 18 | 44% |
+| shirt | 8 | 20 | 40% |
+| full | 8 | 18 | 44% |
+| computer | 8 | 30 | 27% |
+| right | 7 | 18 | 39% |
+| cool | 7 | 21 | 33% |
+| cow | 6 | 19 | 32% |
+| later | 6 | 20 | 30% |
+| same | 6 | 18 | 33% |
+
+**Summary statistics:**
+
+| Metric | Value |
+|:-------|------:|
+| Average retention rate | 70% |
+| Glosses with 100% retention | 16 |
+| Glosses with < 50% retention | 14 |
+| Lowest retention | same, cool, cow, later (30–33%) |
+| Highest WLASL count with low retention | computer (30 → 8, 27%) |
+
+
+### Per-Gloss Video Distribution (Video found)
+
 | Metric | Count |
 |---|---|
 | Total glosses in JSON | 2,000 |
@@ -156,7 +279,6 @@ Total gloss folders: 3,186
 | Videos missing (expired links) | 9,103 |
 | Download rate | ~56.8% |
 
-### Per-Gloss Video Distribution (Video found)
 
 | Min Videos per Gloss | Qualifying Glosses | Total Videos |
 |---:|---:|---:|
