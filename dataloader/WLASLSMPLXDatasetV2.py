@@ -59,7 +59,7 @@ if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     
 from utils.rotation_conversion import axis_angle_to_rot6d, rot6d_to_axis_angle
-from utils.rotation_conversion import ALL_53_JOINTS, UPPER_BODY_INDICES, LOWER_BODY_INDICES, REMOVE_INDICES, FULL_JOINT_NAMES
+from utils.rotation_conversion import ALL_53_JOINTS, UPPER_BODY_INDICES, LOWER_BODY_INDICES, REMOVE_INDICES, FULL_JOINT_NAMES, ALL_INDICES
 
 # ============================================================================
 # Dataset
@@ -102,8 +102,8 @@ class WLASLSMPLXDatasetV2(Dataset):
 
         
         # Configuration
-        self.use_rot6d = getattr(cfg, 'USE_ROT6D', True) if cfg else True
-        self.use_upper_body = getattr(cfg, 'USE_UPPER_BODY', True) if cfg else True
+        self.use_rot6d = getattr(cfg, 'USE_ROT6D', False) if cfg else False
+        self.use_upper_body = getattr(cfg, 'USE_UPPER_BODY', False) if cfg else False
         self.target_seq_len = getattr(cfg, 'TARGET_SEQ_LEN', 40) if cfg else 40
         self.use_mini_dataset = getattr(cfg, 'USE_MINI_DATASET', False) if cfg else False
         self.mini_top_k = getattr(cfg, 'MINI_TOP_K', 5) if cfg else 5
@@ -111,14 +111,16 @@ class WLASLSMPLXDatasetV2(Dataset):
         self.root_dir = getattr(cfg, 'ROOT_DIR', './smplx_params') if cfg else './smplx_params'
 
         # Compute dimensions
-        self.n_joints = 45 if self.use_upper_body else 53
-        self.n_body_joints = 12 if self.use_upper_body else 21 
+        self.n_joints = len(ALL_INDICES)
+
         self.n_feats = 6 if self.use_rot6d else 3
         self.input_dim = self.n_joints * self.n_feats
 
         # Joint indices to use
-        self.joint_indices = UPPER_BODY_INDICES if self.use_upper_body else ALL_53_JOINTS
-
+        # self.joint_indices = UPPER_BODY_INDICES if self.use_upper_body else ALL_53_JOINTS
+        self.joint_indices = ALL_53_JOINTS ## 上半身和下半身不在dataloader里面处理, 保持数据一致, 直接在网络端处理.
+        
+        
         # Data storage
         self.smplx_params_dir = os.path.join(self.root_dir, mode, 'smplx_params')
         self.data_list = []      # [(gloss, video_dir_path), ...]

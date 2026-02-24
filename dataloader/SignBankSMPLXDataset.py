@@ -60,7 +60,7 @@ class SignBankSMPLXDataset(Dataset):
     LHAND_JOINTS = 15
     RHAND_JOINTS = 15
 
-    def __init__(self, mode='train', cfg=None):
+    def __init__(self, mode='train', cfg=None, logger = None):
         """
         Args:
             mode: 'train' or 'test'

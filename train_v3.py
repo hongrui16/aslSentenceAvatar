@@ -34,11 +34,13 @@ from accelerate.logging import get_logger
 from dataloader.SignBankSMPLXDataset import SignBankSMPLXDataset
 from dataloader.WLASLSMPLXDataset import WLASLSMPLXDataset
 from dataloader.WLASLSMPLXDatasetV2 import WLASLSMPLXDatasetV2
+from dataloader.SignBankSMPLXDatasetV2 import SignBankSMPLXDatasetV2
 
 from aslAvatarModel_v5 import MotionDiffusionModel
 
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
 from config import SignBank_SMPLX_Config, WLASL_SMPLX_Config
+from utils.rotation_conversion import get_joint_slices
 
 
 class DiffusionTrainer:
@@ -69,6 +71,7 @@ class DiffusionTrainer:
         # Diffusion-specific config with defaults
         self.cfg.NUM_DIFFUSION_STEPS = getattr(self.cfg, 'NUM_DIFFUSION_STEPS', 1000)
         self.cfg.VEL_WEIGHT = getattr(self.cfg, 'VEL_WEIGHT', 1.0)
+        self.cfg.N_FEATS = 6 if self.cfg.USE_ROT6D else 3
 
         if args.batch_size:
             self.cfg.TRAIN_BSZ = args.batch_size
@@ -153,8 +156,12 @@ class DiffusionTrainer:
 
         # Dataset
         if self.cfg.DATASET_NAME == "SignBank_SMPLX":
-            train_dataset = SignBankSMPLXDataset(mode='train', cfg=self.cfg, logger=self.logger)
-            test_dataset = None
+            if self.cfg.DATASET_VERSION.lower() == 'v1':
+                train_dataset = SignBankSMPLXDataset(mode='train', cfg=self.cfg, logger=self.logger)
+                test_dataset = None
+            elif self.cfg.DATASET_VERSION.lower() == 'v2':
+                train_dataset = SignBankSMPLXDatasetV2(mode='train', cfg=self.cfg, logger=self.logger)
+                test_dataset = None
         elif self.cfg.DATASET_NAME == "WLASL_SMPLX":
             if self.cfg.DATASET_VERSION.lower() == 'v1':
                 train_dataset = WLASLSMPLXDataset(mode='train', cfg=self.cfg, logger=self.logger)
@@ -189,8 +196,8 @@ class DiffusionTrainer:
         self.cfg.INPUT_DIM = train_dataset.input_dim
         self.cfg.GLOSS_NAME_LIST = train_dataset.gloss_name_list
         self.cfg.NUM_CLASSES = len(self.cfg.GLOSS_NAME_LIST)
-        self.cfg.N_FEATS = train_dataset.n_feats
-        self.cfg.N_JOINTS = train_dataset.n_joints
+        
+
 
         # Model
         self.logger.info("Building MotionDiffusionModel...")
@@ -227,29 +234,29 @@ class DiffusionTrainer:
         No KL term — diffusion doesn't need it.
         """
         valid_mask = ~padding_mask  # (B, T)
-        feat = 6 if self.cfg.USE_ROT6D else 3
+        n_feats = 6 if self.cfg.USE_ROT6D else 3
 
-        if self.cfg.USE_UPPER_BODY:
-            ROOT  = slice(0, feat)
-            BODY  = slice(feat, 14 * feat)
-            LHAND = slice(14 * feat, 29 * feat)
-            RHAND = slice(29 * feat, 44 * feat)
-            JAW   = slice(44 * feat, 45 * feat)
-        else:
-            ROOT  = slice(0, feat)
-            BODY  = slice(feat, 22 * feat)
-            LHAND = slice(22 * feat, 37 * feat)
-            RHAND = slice(37 * feat, 52 * feat)
-            JAW   = slice(52 * feat, 53 * feat)
 
         def masked_mse(pred, gt):
             mse = F.mse_loss(pred, gt, reduction='none')
             mask = valid_mask.unsqueeze(-1).expand_as(mse).float()
             return (mse * mask).sum() / (mask.sum() + 1e-8)
 
+        joint_groups = get_joint_slices(n_feats=n_feats)
+
+        ROOT = joint_groups['ROOT']
+        LOWER_BODY = joint_groups['LOWER_BODY']
+        TORSO      = joint_groups['TORSO']
+        ARMS       = joint_groups['ARMS']
+        LHAND      = joint_groups['LHAND']
+        RHAND      = joint_groups['RHAND']
+        JAW        = joint_groups['JAW']
+        
         # Weighted reconstruction
-        mse_loss = (0.1 * masked_mse(x_0_pred[..., ROOT],  x_0[..., ROOT])
-                  + 1.0 * masked_mse(x_0_pred[..., BODY],  x_0[..., BODY])
+        mse_loss = (0.5 * masked_mse(x_0_pred[..., TORSO],  x_0[..., TORSO])
+                  + 0.0 * masked_mse(x_0_pred[..., ROOT],  x_0[..., ROOT])
+                  + 0.0 * masked_mse(x_0_pred[..., LOWER_BODY],  x_0[..., LOWER_BODY])
+                  + 5.0 * masked_mse(x_0_pred[..., ARMS], x_0[..., ARMS])
                   + 5.0 * masked_mse(x_0_pred[..., LHAND], x_0[..., LHAND])
                   + 5.0 * masked_mse(x_0_pred[..., RHAND], x_0[..., RHAND])
                   + 0.1 * masked_mse(x_0_pred[..., JAW],   x_0[..., JAW]))
@@ -264,8 +271,10 @@ class DiffusionTrainer:
             mask = vel_valid.unsqueeze(-1).expand_as(mse).float()
             return (mse * mask).sum() / (mask.sum() + 1e-8)
 
-        vel_loss = (0.1 * masked_vel(vel_pred[..., ROOT],  vel_gt[..., ROOT])
-                  + 1.0 * masked_vel(vel_pred[..., BODY],  vel_gt[..., BODY])
+        vel_loss = (0.5 * masked_vel(vel_pred[..., TORSO],  vel_gt[..., TORSO])
+                  + 0.0 * masked_vel(vel_pred[..., ROOT],  vel_gt[..., ROOT])
+                  + 0.0 * masked_vel(vel_pred[..., LOWER_BODY],  vel_gt[..., LOWER_BODY])
+                  + 5.0 * masked_vel(vel_pred[..., ARMS],  vel_gt[..., ARMS])
                   + 5.0 * masked_vel(vel_pred[..., LHAND], vel_gt[..., LHAND])
                   + 5.0 * masked_vel(vel_pred[..., RHAND], vel_gt[..., RHAND])
                   + 0.1 * masked_vel(vel_pred[..., JAW],   vel_gt[..., JAW]))
@@ -318,7 +327,7 @@ class DiffusionTrainer:
                 x_t = unwrapped.q_sample(motion, t, noise)
 
                 # Predict x_0
-                x_0_pred = self.model(x_t, t, cond, padding_mask)
+                x_0_pred = self.model(x_t, t, cond, padding_mask, motion)
 
                 # Loss
                 loss, mse, vel = self.compute_loss(x_0_pred, motion, padding_mask)
@@ -381,7 +390,7 @@ class DiffusionTrainer:
             t = torch.full((B,), 500, dtype=torch.long, device=motion.device)
             noise = torch.randn_like(motion)
             x_t = unwrapped.q_sample(motion, t, noise)
-            x_0_pred = self.model(x_t, t, cond, padding_mask)
+            x_0_pred = self.model(x_t, t, cond, padding_mask, motion)
 
             loss, mse, vel = self.compute_loss(x_0_pred, motion, padding_mask)
             total_loss += loss.item()

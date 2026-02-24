@@ -1,27 +1,34 @@
 import torch
 import numpy as np
 
+"""
+Joint Selection & Group Constants for Sign Language Motion Generation
+=====================================================================
 
+Group definitions (by original 53-joint index):
+
+  LOWER:  [0,1,2,3,4,5,7,8,10,11]  pelvis, spine1, hips, knees, ankles, feet (10)
+  TORSO:  [6,9,12,13,14,15]         spine2, spine3, neck, L/R collar, head    (6)
+  ARMS:   [16,17,18,19,20,21]       L/R shoulder, elbow, wrist                (6)
+  LHAND:  [22-36]                    left hand fingers                         (15)
+  RHAND:  [37-51]                    right hand fingers                        (15)
+  JAW:    [52]                       jaw                                       (1)
+                                                                         Total: 53
+
+Three joint selection levels:
+
+  all (53):          LOWER(10) + TORSO(6) + ARMS(6) + LHAND(15) + RHAND(15) + JAW(1)
+
+Loss weight recommendation:
+    0.0 * LOWER + 0.2 * TORSO + 5.0 * ARMS + 5.0 * LHAND + 5.0 * RHAND + 0.1 * JAW
+"""
 
 # ============================================================================
-# Joint Selection Constants
+# Joint names
 # ============================================================================
 
-# Full 53-joint array indices
-ALL_53_JOINTS = list(range(53))
-
-# Lower body + jaw indices to REMOVE (8 joints)
-LOWER_BODY_INDICES = [1, 2, 4, 5, 7, 8, 10, 11]  # hips, knees, ankles, feet
-REMOVE_INDICES = set(LOWER_BODY_INDICES)  # 8 joints
-
-# Upper body indices to KEEP (44 joints)
-UPPER_BODY_INDICES = [i for i in ALL_53_JOINTS if i not in REMOVE_INDICES]
-assert len(UPPER_BODY_INDICES) == 45, f"Expected 45 upper body joints, got {len(UPPER_BODY_INDICES)}"
-
-# Joint names for reference / debugging
 FULL_JOINT_NAMES = {
-    0: 'root/pelvis',
-    1: 'left_hip', 2: 'right_hip', 3: 'spine1',
+    0: 'pelvis', 1: 'left_hip', 2: 'right_hip', 3: 'spine1',
     4: 'left_knee', 5: 'right_knee', 6: 'spine2',
     7: 'left_ankle', 8: 'right_ankle', 9: 'spine3',
     10: 'left_foot', 11: 'right_foot', 12: 'neck',
@@ -29,13 +36,61 @@ FULL_JOINT_NAMES = {
     16: 'left_shoulder', 17: 'right_shoulder',
     18: 'left_elbow', 19: 'right_elbow',
     20: 'left_wrist', 21: 'right_wrist',
-    # 22-36: left hand fingers (15 joints)
-    # 37-51: right hand fingers (15 joints)
     52: 'jaw',
 }
 for i in range(15):
     FULL_JOINT_NAMES[22 + i] = f'lhand_{i}'
     FULL_JOINT_NAMES[37 + i] = f'rhand_{i}'
+ALL_53_JOINTS = list(range(53))
+
+'''
+root(0) → spine1(3) → spine2(6) → spine3(9) → neck(12) → head(15)
+                                              → L_collar(13) → L_shoulder(16) → L_elbow(18) → L_wrist(20) → L_hand...
+'''
+ROOT_INDICES = [0] ## control the whole body rotation
+LOWER_BODY_INDICES = [1, 2, 3, 4, 5, 7, 8, 10, 11]
+TORSO_INDICES      = [6, 9, 12, 13, 14, 15]
+ARMS_INDICES       = [16, 17, 18, 19, 20, 21]
+BODY_INDICES       = list(range(22))
+LHAND_INDICES      = list(range(22, 37))
+RHAND_INDICES      = list(range(37, 52))
+JAW_INDICES        = [52]
+ALL_INDICES        = [i for i in range(53)]
+
+REMOVE_INDICES = set(LOWER_BODY_INDICES)
+UPPER_BODY_INDICES = [i for i in ALL_53_JOINTS if i not in REMOVE_INDICES]
+
+
+def get_joint_slices(n_feats=3):
+    """
+    Return feature-level indices for each joint group.
+
+    Args:
+        n_feats: 3 (axis-angle) or 6 (rot6d)
+
+    Returns:
+        dict with: BODY, LOWER_BODY, TORSO, ARMS, LHAND, RHAND, JAW
+        Each value is a list of int indices into dim=-1.
+    """
+    def idx(joints):
+        out = []
+        for j in joints:
+            out.extend(range(j * n_feats, (j + 1) * n_feats))
+        return out
+
+    return {
+        'ROOT':       idx(ROOT_INDICES),
+        'BODY':       idx(BODY_INDICES),
+        'LOWER_BODY': idx(LOWER_BODY_INDICES),
+        'TORSO':      idx(TORSO_INDICES),
+        'ARMS':       idx(ARMS_INDICES),
+        'LHAND':      idx(LHAND_INDICES),
+        'RHAND':      idx(RHAND_INDICES),
+        'JAW':        idx(JAW_INDICES),
+        'ALL':        idx(ALL_INDICES),
+    }
+
+
 
 
 # ============================================================================
@@ -85,16 +140,9 @@ def axis_angle_to_matrix(rotvec):
 
 
 def matrix_to_rot6d(matrix):
-    """
-    Convert rotation matrix to 6D representation (first two columns).
-
-    Args:
-        matrix: (*, 3, 3) rotation matrices
-
-    Returns:
-        rot6d: (*, 6) 6D rotation vectors
-    """
-    return matrix[..., :, :2].reshape(*matrix.shape[:-2], 6)
+    col1 = matrix[..., :, 0]  # (*, 3)
+    col2 = matrix[..., :, 1]  # (*, 3)
+    return torch.cat([col1, col2], dim=-1)  # (*, 6)
 
 
 def rot6d_to_matrix(rot6d):
@@ -196,21 +244,16 @@ def postprocess_motion(motion_raw, cfg):
     seq = torch.from_numpy(motion_raw).float()
     T = seq.shape[0]
 
-    n_joints = 44 if use_upper_body else 53
+
     n_feats = 6 if use_rot6d else 3
 
     # (T, input_dim) → (T, N_joints, N_feats)
-    seq = seq.reshape(T, n_joints, n_feats)
+    seq = seq.reshape(T, -1, n_feats)
 
     # 6D → axis-angle
     if use_rot6d:
         seq = rot6d_to_axis_angle(seq)  # (T, N_joints, 3)
 
     # 44 upper body → 53 full body (lower body = zeros = neutral pose)
-    if use_upper_body:
-        full = torch.zeros(T, 53, 3, dtype=seq.dtype)
-        for new_idx, orig_idx in enumerate(UPPER_BODY_INDICES):
-            full[:, orig_idx, :] = seq[:, new_idx, :]
-        seq = full
 
     return seq.reshape(T, -1).numpy()  # (T, 159)

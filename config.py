@@ -70,9 +70,9 @@ class BaseConfig:
         
         self.VEL_WEIGHT  = 1.0
         self.ROOT_NORMALIZE = True
-        self.N_FEATS = 6 if self.USE_ROT6D else 3
-        self.N_JOINTS = 45 if self.USE_UPPER_BODY else 53
-
+        
+        self.N_JOINTS = 53
+        self.N_FEATS = 3
 
 class ASLLVD_Skeleton3D_Config(BaseConfig):
     """Training configuration"""
@@ -125,7 +125,7 @@ class SignBank_SMPLX_Config(BaseConfig):
         self.MAX_SEQ_LEN = 100
         
         # Sequence interpolation (original data has only 2-4 frames per sample)
-        self.TARGET_SEQ_LEN = 48  # Target sampling sequence length
+        self.TARGET_SEQ_LEN = 40  # Target sampling sequence length
         self.INTERPOLATE_SHORT_SEQ = False  # Whether to interpolate short sequences
                 
         # ==================== Model Architecture ====================
@@ -138,7 +138,9 @@ class SignBank_SMPLX_Config(BaseConfig):
         # ==================== Training ====================
         self.TRAIN_BSZ = 400
         self.EVAL_BSZ = 200
-
+        
+        self.MODEL_VERSION = 'v5'
+        self.DATASET_VERSION = 'v2'
 
 
 
@@ -151,8 +153,8 @@ class WLASL_SMPLX_Config(BaseConfig):
         
         # ==================== ASLLVD_Skeleton3D ====================
         self.DATASET_NAME = "WLASL_SMPLX"
-        # self.ROOT_DIR ='/scratch/rhong5/dataset/wlasl'
-        self.ROOT_DIR ='/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/data/synthetic_smplx_data'
+        self.ROOT_DIR ='/scratch/rhong5/dataset/wlasl'
+        # self.ROOT_DIR ='/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/data/synthetic_smplx_data'
         
 
         # ==================== Data Dimensions ====================
@@ -177,7 +179,7 @@ class WLASL_SMPLX_Config(BaseConfig):
         self.TRAIN_BSZ = 100
         self.EVAL_BSZ = 100
         
-        self.MODEL_VERSION = 'v4'
+        self.MODEL_VERSION = 'v5'
         self.DATASET_VERSION = 'v2'
 
         self.USE_ROT6D = True

@@ -223,7 +223,7 @@ def render_video_sample(smpl_x, video_dir, out_dir,
 
     if make_gif and frames_rgb:
         gif_path = os.path.join(out_dir, "animation.gif")
-        imageio.mimsave(gif_path, frames_rgb, fps=10, loop=0)
+        imageio.mimsave(gif_path, frames_rgb, fps=8, loop=0)
 
     return T
 

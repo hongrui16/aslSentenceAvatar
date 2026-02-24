@@ -116,6 +116,39 @@ Total gloss folders: 3,186
 **Source:** WLASL v0.3 JSON (2,000 glosses, ~21K annotated instances)  
 **Videos downloaded via:** `yt-dlp` from YouTube (many links expired)
 
+## WLASL Per-Gloss Video Distribution
+
+| Min Videos per Gloss | Qualifying Glosses | Total Videos |
+|:--------------------:|-------------------:|-------------:|
+| ≥ 1                  | 2,000              | 21,083       |
+| ≥ 6                  | 2,000              | 21,083       |
+| ≥ 11                 | 803                | 11,201       |
+| ≥ 16                 | 179                | 3,346        |
+| ≥ 21                 | 32                 | 751          |
+| ≥ 26                 | 6                  | 183          |
+| ≥ 31                 | 2                  | 75           |
+| ≥ 36                 | 1                  | 40           |
+| ≥ 41                 | 0                  | 0            |
+
+## ASL-LEX ∩ WLASL Cross-Reference
+
+- **ASL-LEX total glosses:** 2,719
+- **WLASL total glosses:** 2,000
+- **Overlapping glosses:** 1,272 (46.8% of ASL-LEX)
+
+| Min Videos per Gloss | Qualifying Glosses | Total Videos |
+|:--------------------:|-------------------:|-------------:|
+| ≥ 1                  | 1,272              | 14,586       |
+| ≥ 6                  | 1,272              | 14,586       |
+| ≥ 11                 | 677                | 9,490        |
+| ≥ 16                 | 154                | 2,879        |
+| ≥ 21                 | 27                 | 640          |
+| ≥ 26                 | 6                  | 183          |
+| ≥ 31                 | 2                  | 75           |
+| ≥ 36                 | 1                  | 40           |
+| ≥ 41                 | 0                  | 0            |
+
+
 | Metric | Count |
 |---|---|
 | Total glosses in JSON | 2,000 |
@@ -123,7 +156,7 @@ Total gloss folders: 3,186
 | Videos missing (expired links) | 9,103 |
 | Download rate | ~56.8% |
 
-### Per-Gloss Video Distribution
+### Per-Gloss Video Distribution (Video found)
 
 | Min Videos per Gloss | Qualifying Glosses | Total Videos |
 |---:|---:|---:|
@@ -137,6 +170,41 @@ Total gloss folders: 3,186
 | ≥ 18 | 0 | 0 |
 | ≥ 20 | 0 | 0 |
 
+
+### WLASL SMPL-X Frame Statistics (Train Split)
+
+
+| Metric | Value |
+|---|---|
+| Total videos | 1,056 |
+| Total frames | 23,511 |
+| Min | 5 |
+| Max | 73 |
+| Mean | 22.3 |
+| Median | 22.0 |
+
+| Frame Range | Videos | Ratio | Cumulative |
+|---|---:|---:|---:|
+| 5–9 | 96 | 9.09% | 9.09% |
+| 10–14 | 117 | 11.08% | 20.17% |
+| 15–19 | 208 | 19.70% | 39.87% |
+| 20–24 | 243 | 23.01% | 62.88% |
+| 25–29 | 187 | 17.71% | 80.59% |
+| 30–34 | 102 | 9.66% | 90.25% |
+| 35–39 | 55 | 5.21% | 95.45% |
+| 40–44 | 27 | 2.56% | 98.01% |
+| 45–49 | 9 | 0.85% | 98.86% |
+| 50–54 | 7 | 0.66% | 99.53% |
+| 55–59 | 2 | 0.19% | 99.72% |
+| 60–64 | 1 | 0.09% | 99.81% |
+| 65–69 | 0 | 0.00% | 99.81% |
+| 70–74 | 2 | 0.19% | 100.00% |
+
+- 50% of videos: 16–28 frames
+- 80% of videos: 10–34 frames
+- Peak: 20–24 frames (23.01%)
+
+Motion filtering: `frame_interval=2`, `motion_thr=1.0` (lowered from default 2.15 for retry).
 ---
 
 ## SMPL-X Extraction

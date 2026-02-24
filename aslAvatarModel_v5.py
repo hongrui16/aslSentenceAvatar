@@ -31,7 +31,7 @@ import torch.nn as nn
 import math
 from transformers import CLIPTokenizer, CLIPTextModel
 
-
+from utils.rotation_conversion import LOWER_BODY_INDICES, ROOT_INDICES, TORSO_INDICES, ALL_INDICES, get_joint_slices
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -93,10 +93,26 @@ class MotionDiffusionModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        
         self.input_dim = cfg.INPUT_DIM
+        
+        
+        joint_groups = get_joint_slices(n_feats=cfg.N_FEATS)
+        root_slices = joint_groups['ROOT']
+        lower_body_slices = joint_groups['LOWER_BODY']
+        self.all_slices = joint_groups['ALL']
+        
+        
+        self.bypass_slices = []
         if cfg.ROOT_NORMALIZE:
-            self.input_dim = (cfg.N_JOINTS - 1) * cfg.N_FEATS
-
+            self.input_dim -= len(ROOT_INDICES) * cfg.N_FEATS
+            self.bypass_slices += root_slices
+        if cfg.USE_UPPER_BODY:
+            self.input_dim -= len(LOWER_BODY_INDICES) * cfg.N_FEATS
+            self.bypass_slices += lower_body_slices
+                                    
+        self.tosave_slices = [i for i in self.all_slices if i not in set(self.bypass_slices)]  # all_slices - self.bypass_slices
+        
         # Diffusion params
         self.num_timesteps = getattr(cfg, 'NUM_DIFFUSION_STEPS', 1000)
         self._register_schedule()
@@ -180,6 +196,7 @@ class MotionDiffusionModel(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
+    
     # ------------------------------------------------------------------ condition
     def get_condition(self, cond_input, device):
         """
@@ -199,6 +216,7 @@ class MotionDiffusionModel(nn.Module):
                 clip_emb = self.text_encoder(**inputs).pooler_output
             return self.condition_proj(clip_emb)
 
+    
     # ------------------------------------------------------------------ diffusion ops
     def q_sample(self, x_0, t, noise=None):
         """Forward diffusion: x_0 → x_t."""
@@ -215,6 +233,7 @@ class MotionDiffusionModel(nn.Module):
 
         return sqrt_alpha * x_0 + sqrt_one_minus * noise
 
+    
     # ------------------------------------------------------------------ denoiser
     def denoise(self, x_t, t, condition, padding_mask=None):
         """
@@ -228,12 +247,6 @@ class MotionDiffusionModel(nn.Module):
         B, T, _ = x_t.shape
         device = x_t.device
 
-        # Strip root if needed
-        if self.cfg.ROOT_NORMALIZE:
-            x_t_input = x_t[:, :, self.cfg.N_FEATS:]
-        else:
-            x_t_input = x_t
-
         # Timestep token
         t_emb = sinusoidal_embedding(t, self.cfg.MODEL_DIM)    # (B, D)
         t_token = self.timestep_proj(t_emb).unsqueeze(1)        # (B, 1, D)
@@ -242,7 +255,7 @@ class MotionDiffusionModel(nn.Module):
         c_token = condition.unsqueeze(1)                         # (B, 1, D)
 
         # Motion tokens
-        motion_tokens = self.pose_proj(x_t_input)               # (B, T, D)
+        motion_tokens = self.pose_proj(x_t)               # (B, T, D)
         motion_tokens = self.pe(motion_tokens)                   # + positional encoding
 
         # Concat: [t, c, motion...]
@@ -262,15 +275,12 @@ class MotionDiffusionModel(nn.Module):
         motion_out = out[:, 2:, :]
         x_0_pred = self.output_proj(motion_out)  # (B, T, input_dim)
 
-        # Prepend root zeros if needed
-        if self.cfg.ROOT_NORMALIZE:
-            zeros = torch.zeros(B, T, self.cfg.N_FEATS, device=device)
-            x_0_pred = torch.cat([zeros, x_0_pred], dim=-1)
+
 
         return x_0_pred
 
     # ------------------------------------------------------------------ forward
-    def forward(self, x_t, t, cond_input, padding_mask=None):
+    def forward(self, x_t, t, cond_input, padding_mask=None, motion = None):
         """
         Forward pass for training.
 
@@ -279,12 +289,24 @@ class MotionDiffusionModel(nn.Module):
             t:           (B,) integer timesteps
             cond_input:  List[str] or LongTensor (B,)
             padding_mask: (B, T) True where padded
+            motion:      (B, T, D) original motion 
 
         Returns:
             x_0_pred: (B, T, D) predicted clean motion
         """
-        condition = self.get_condition(cond_input, x_t.device)
-        return self.denoise(x_t, t, condition, padding_mask)
+        condition = self.get_condition(cond_input, x_t.device)        
+        x_t = x_t[:, :, self.tosave_slices]
+        
+        x_0_pred = self.denoise(x_t, t, condition, padding_mask)
+        if len(self.all_slices) == len(self.tosave_slices):
+            return x_0_pred
+        
+        out = motion.clone()
+        out = out.to(x_0_pred.dtype)
+        out[:,:, self.tosave_slices] = x_0_pred
+        return out
+        
+        
 
     # ------------------------------------------------------------------ generation
     @torch.no_grad()
@@ -313,7 +335,7 @@ class MotionDiffusionModel(nn.Module):
         timesteps = list(reversed(timesteps))  # [T-1, ..., 0]
 
         # Start from pure noise
-        x_t = torch.randn(B, seq_len, self.input_dim + (self.cfg.N_FEATS if self.cfg.ROOT_NORMALIZE else 0),
+        x_t = torch.randn(B, seq_len, self.input_dim,
                            device=device)
 
         for i, t_cur in enumerate(timesteps):
@@ -341,15 +363,16 @@ class MotionDiffusionModel(nn.Module):
                     + torch.sqrt(1 - alpha_next - sigma**2) * eps
                     + sigma * torch.randn_like(x_t))
 
-        return x_t
+        B, T, D = x_t.shape
+        if D < len(self.all_slices):
+            out = torch.zeros(B, T, len(self.all_slices), dtype=x_t.dtype, device=device)
+            out[:,:, self.tosave_slices] = x_t
+        else:
+            out = x_t
+        
+        return out
 
-    @torch.no_grad()
-    def reconstruct(self, x_0, cond_input, padding_mask=None,
-                    noise_level=100):
-        """
-        Reconstruction: add noise to x_0 then denoise.
-        Useful for evaluating reconstruction quality.
-        """
+    def reconstruct(self, x_0, cond_input, padding_mask=None, noise_level=100):
         self.eval()
         device = x_0.device
         B = x_0.shape[0]
@@ -359,4 +382,10 @@ class MotionDiffusionModel(nn.Module):
         noise = torch.randn_like(x_0)
         x_t = self.q_sample(x_0, t, noise)
 
-        return self.denoise(x_t, t, condition, padding_mask)
+        x_0_pred = self.denoise(x_t[:, :, self.tosave_slices], t, condition, padding_mask)
+        if len(self.all_slices) == len(self.tosave_slices):
+            return x_0_pred
+
+        out = x_0.clone()
+        out[:, :, self.tosave_slices] = x_0_pred
+        return out

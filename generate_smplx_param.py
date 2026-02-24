@@ -36,6 +36,7 @@ from aslAvatarModel import ASLAvatarModel
 from aslAvatarModel_v2 import ASLAvatarModelV2
 from aslAvatarModel_v3 import ASLAvatarModelV3
 from aslAvatarModel_v4 import ASLAvatarModelV4
+from aslAvatarModel_v5 import MotionDiffusionModel
 
 from config import SignBank_SMPLX_Config
 from config import WLASL_SMPLX_Config
@@ -270,6 +271,7 @@ def process_gloss(model, gloss, output_dir, seq_len, device,
                   smpl_x=None, img_size=512, dump_param = False, cfg = None, make_gif=True, gif_fps=8):
     
     motion = generate_from_gloss(model, gloss, seq_len, device, cfg)  # (T, 159)
+    print('motion.shape', motion.shape, 'cfg.N_FEATS', cfg.N_FEATS)
     T = motion.shape[0]
 
     gloss_dir = os.path.join(output_dir, gloss)
@@ -383,7 +385,7 @@ def main(args):
     cfg.USE_MINI_DATASET = args.use_mini_dataset
     cfg.USE_LABEL_INDEX_COND= args.use_label_index_cond
     cfg.ROOT_NORMALIZE = not args.no_root_normalize
-        
+    cfg.N_FEATS = 6 if cfg.USE_ROT6D else 3
     
     if args.output_dir is None:
         checkpoint_dir = os.path.dirname(args.checkpoint)        
@@ -445,6 +447,8 @@ def main(args):
             model = ASLAvatarModelV2(cfg)
         elif cfg.MODEL_VERSION.lower() == 'v4':
             model = ASLAvatarModelV4(cfg)
+        elif cfg.MODEL_VERSION.lower() == 'v5':
+            model = MotionDiffusionModel(cfg)
         else:
             raise ValueError('incorrect model version!')
     else:

@@ -30,12 +30,20 @@ echo "Random port: $PORT"
 
 
 # Launch distributed training with accelerate
+# accelerate launch --num_processes=1 \
+#     --num_machines=1 \
+#     --machine_rank=0 \
+#     --main_process_ip=localhost \
+#     --main_process_port=$PORT \
+#     train_v3.py  --dataset WLASL_SMPLX  --use_mini_dataset --use_upper_body --use_rot6d
+
 accelerate launch --num_processes=1 \
     --num_machines=1 \
     --machine_rank=0 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
-    train_v3.py  --dataset WLASL_SMPLX  --use_mini_dataset 
+    train_v3.py  --dataset SignBank_SMPLX  --use_upper_body
+
 #--use_lebel_index_cond
 # --use_rot6d
 

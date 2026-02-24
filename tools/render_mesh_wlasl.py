@@ -64,6 +64,7 @@ import cv2
 import trimesh
 import pyrender
 import sys
+import random
 
 if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -119,6 +120,9 @@ def render_a_gloss_instance(video_path, gloss_param_dir, out_dir, use_bg=True, a
         return
 
     os.makedirs(out_dir, exist_ok=True)
+    out_img_dir = os.path.join(out_dir, 'img')
+    os.makedirs(out_img_dir, exist_ok=True)
+    
 
     # Open video once, seek per frame
     has_video = os.path.isfile(video_path) and use_bg
@@ -166,7 +170,7 @@ def render_a_gloss_instance(video_path, gloss_param_dir, out_dir, use_bg=True, a
         # Render overlay
         rendered = render_mesh(bg, vertices, faces, cam, alpha=alpha)
 
-        out_path = os.path.join(out_dir, f"{base_name}_render.png")
+        out_path = os.path.join(out_img_dir, f"{base_name}_render.png")
         cv2.imwrite(out_path, cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR))
         rendered_count += 1
 
@@ -185,12 +189,13 @@ def render_a_gloss_instance(video_path, gloss_param_dir, out_dir, use_bg=True, a
 
 
 def process_all_gloss_categories(gloss_parent_dir, video_source_dir, out_dir, use_bg=True, alpha=0.8,
-                                 gloss_name_list=None, make_gif=False, gif_fps=10):
+                                 gloss_name_list=None, make_gif=False, gif_fps=10, max_video_num = 6):
     gloss_names = os.listdir(gloss_parent_dir) if gloss_name_list is None else gloss_name_list
     for gloss in gloss_names:
         video_parent_dir = os.path.join(gloss_parent_dir, gloss)
         video_names = os.listdir(video_parent_dir)
-        for video_na in video_names:
+        random.shuffle(video_names)
+        for vi_id, video_na in enumerate(video_names):
             video_filepath = os.path.join(video_source_dir, f"{video_na}.mp4")
             save_img_dir = os.path.join(out_dir, gloss, video_na)
             gloss_param_dir = os.path.join(gloss_parent_dir, gloss, video_na)
@@ -199,6 +204,8 @@ def process_all_gloss_categories(gloss_parent_dir, video_source_dir, out_dir, us
                                     use_bg=use_bg, alpha=alpha,
                                     make_gif=make_gif, 
                                     gif_fps=gif_fps)
+            if vi_id >= (max_video_num -1):
+                break
     
 
 
