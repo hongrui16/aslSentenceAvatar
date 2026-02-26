@@ -40,12 +40,14 @@ from aslAvatarModel_v5 import MotionDiffusionModel
 
 from config import SignBank_SMPLX_Config
 from config import WLASL_SMPLX_Config
+from config import ASL3DWord_SMPLX_Config
+
 # from dataloader.WLASLSMPLXDataset import WLASLSMPLXDataset
 from dataloader.SignBankSMPLXDataset import SignBankSMPLXDataset
 
 from dataloader.WLASLSMPLXDataset import WLASLSMPLXDataset
 from dataloader.WLASLSMPLXDatasetV2 import WLASLSMPLXDatasetV2
-
+from dataloader.ASL3DWordDataset import ASL3DWordDataset
 
 from utils.rotation_conversion import postprocess_motion
 
@@ -267,7 +269,7 @@ def render_smplx_frame(vertices, faces, img_w=512, img_h=512,
 # =============================================================================
 # Process one gloss
 # =============================================================================
-def process_gloss(model, gloss, output_dir, seq_len, device,
+def process_a_gloss(model, gloss, output_dir, seq_len, device,
                   smpl_x=None, img_size=512, dump_param = False, cfg = None, make_gif=True, gif_fps=8):
     
     motion = generate_from_gloss(model, gloss, seq_len, device, cfg)  # (T, 159)
@@ -297,20 +299,20 @@ def process_gloss(model, gloss, output_dir, seq_len, device,
                 vertices, faces = params_to_mesh(smpl_x, params)
 
                 # Debug: print mesh stats for first frame
-                if t == 0:
-                    print(f"  [{gloss}] vertices: shape={vertices.shape}, "
-                          f"min={vertices.min(axis=0)}, max={vertices.max(axis=0)}")
-                    print(f"  [{gloss}] faces: shape={faces.shape}, "
-                          f"min={faces.min()}, max={faces.max()}")
-                    has_nan = np.any(np.isnan(vertices))
-                    has_inf = np.any(np.isinf(vertices))
-                    print(f"  [{gloss}] NaN={has_nan}, Inf={has_inf}")
+                # if t == 0:
+                #     print(f"  [{gloss}] vertices: shape={vertices.shape}, "
+                #           f"min={vertices.min(axis=0)}, max={vertices.max(axis=0)}")
+                #     print(f"  [{gloss}] faces: shape={faces.shape}, "
+                #           f"min={faces.min()}, max={faces.max()}")
+                #     has_nan = np.any(np.isnan(vertices))
+                #     has_inf = np.any(np.isinf(vertices))
+                #     print(f"  [{gloss}] NaN={has_nan}, Inf={has_inf}")
 
                 img = render_smplx_frame(vertices, faces, 
                                          img_w=img_size, img_h=img_size,
                                          debug=(t == 0), gloss=gloss)
                 img_path = os.path.join(render_dir, f"{gloss}_{t:06d}.png")
-                cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                # cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                 
                 if make_gif:
                     gif_frames.append(img)
@@ -376,6 +378,8 @@ def main(args):
         Config = SignBank_SMPLX_Config
     elif args.dataset_name == "WLASL_SMPLX":
         Config = WLASL_SMPLX_Config
+    elif args.dataset_name == 'ASL3DWord':
+        Config = ASL3DWord_SMPLX_Config
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     
@@ -429,6 +433,11 @@ def main(args):
         elif cfg.DATASET_VERSION.lower() == 'v2':
             train_dataset = WLASLSMPLXDatasetV2(mode='train', cfg=cfg, logger=logger)
             # test_dataset = WLASLSMPLXDatasetV2(mode='test', cfg=cfg)
+    elif cfg.DATASET_NAME == "ASL3DWord":
+        if cfg.DATASET_VERSION.lower() == 'v1':
+            train_dataset = ASL3DWordDataset(mode='train', cfg=cfg, logger=logger)
+            test_dataset = ASL3DWordDataset(mode='test', cfg=cfg, logger=logger)
+
     else:
         raise ValueError(f"Unknown dataset: {cfg.DATASET_NAME}")
     
@@ -463,12 +472,9 @@ def main(args):
     # Determine glosses
     if args.glosses:
         glosses = args.glosses
-    elif args.from_dataset:
-        root = args.dataset_dir or getattr(cfg, 'ROOT_DIR', '')
-        glosses = get_glosses_from_dataset(root, args.num_glosses)
     else:
-        print("ERROR: provide --glosses or --from_dataset")
-        return
+        glosses = cfg.GLOSS_NAME_LIST
+   
 
     # Load SMPL-X model if rendering
     smpl_x = None
@@ -484,7 +490,7 @@ def main(args):
 
     total = 0
     for gloss in tqdm(glosses, desc="Generating"):
-        total += process_gloss(
+        total += process_a_gloss(
             model, gloss, output_dir, seq_len, device,
             smpl_x=smpl_x, img_size=args.img_size,
             dump_param=args.dump_param,
@@ -502,7 +508,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SMPL-X Generation (params only)")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--dataset_name", type=str, default="WLASL_SMPLX", choices=["SignBank_SMPLX", "WLASL_SMPLX"], help="Dataset to use")
+    parser.add_argument("--dataset_name", type=str, default="WLASL_SMPLX", choices=["SignBank_SMPLX", "WLASL_SMPLX", "ASL3DWord"], help="Dataset to use")
     parser.add_argument("--glosses", type=str, nargs='+', default=None, help="e.g. --glosses amazing hello")
     parser.add_argument("--from_dataset", action="store_true")
     parser.add_argument("--dataset_dir", type=str, default=None)

@@ -35,11 +35,12 @@ from dataloader.SignBankSMPLXDataset import SignBankSMPLXDataset
 from dataloader.WLASLSMPLXDataset import WLASLSMPLXDataset
 from dataloader.WLASLSMPLXDatasetV2 import WLASLSMPLXDatasetV2
 from dataloader.SignBankSMPLXDatasetV2 import SignBankSMPLXDatasetV2
+from dataloader.ASL3DWordDataset import ASL3DWordDataset
 
 from aslAvatarModel_v5 import MotionDiffusionModel
 
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
-from config import SignBank_SMPLX_Config, WLASL_SMPLX_Config
+from config import SignBank_SMPLX_Config, WLASL_SMPLX_Config, ASL3DWord_SMPLX_Config
 from utils.rotation_conversion import get_joint_slices
 
 
@@ -55,6 +56,8 @@ class DiffusionTrainer:
             Config = SignBank_SMPLX_Config
         elif args.dataset == "WLASL_SMPLX":
             Config = WLASL_SMPLX_Config
+        elif args.dataset == 'ASL3DWord':
+            Config = ASL3DWord_SMPLX_Config
         else:
             raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -170,6 +173,11 @@ class DiffusionTrainer:
                 train_dataset = WLASLSMPLXDatasetV2(mode='train', cfg=self.cfg, logger=self.logger)
                 test_dataset = WLASLSMPLXDatasetV2(mode='test', cfg=self.cfg, logger=self.logger,
                                                      gloss_names=train_dataset.gloss_name_list)
+        elif self.cfg.DATASET_NAME == "ASL3DWord":
+            if self.cfg.DATASET_VERSION.lower() == 'v1':
+                train_dataset = ASL3DWordDataset(mode='train', cfg=self.cfg, logger=self.logger)
+                test_dataset = ASL3DWordDataset(mode='test', cfg=self.cfg, logger=self.logger)
+                
         else:
             raise ValueError(f"Unknown dataset: {self.cfg.DATASET_NAME}")
 
@@ -552,7 +560,7 @@ def parse_args():
     parser.add_argument("--finetune", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--dataset", type=str, default="WLASL_SMPLX",
-                        choices=["SignBank_SMPLX", "WLASL_SMPLX"])
+                        choices=["SignBank_SMPLX", "WLASL_SMPLX", "ASL3DWord"])
     parser.add_argument("--use_upper_body", action="store_true", default=False)
     parser.add_argument("--use_rot6d", action="store_true", default=False)
     parser.add_argument("--use_mini_dataset", action="store_true", default=False)

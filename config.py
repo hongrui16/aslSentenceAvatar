@@ -45,7 +45,7 @@ class BaseConfig:
         
         # Paths (adjust to your environment)
         self.LOG_DIR = "/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/zlog"
-        self.CKPT_DIR = "/scratch/rhong5/weights/temp_training_weights/"
+        self.CKPT_DIR = "/scratch/rhong5/weights/temp_training_weights/aslAvatar"
         
         
         self.RESUME = None  # Path to checkpoint for resuming training
@@ -186,3 +186,46 @@ class WLASL_SMPLX_Config(BaseConfig):
         self.USE_UPPER_BODY = True
         
 
+
+
+class ASL3DWord_SMPLX_Config(BaseConfig):
+    """Training configuration"""
+    
+    def __init__(self):
+        super().__init__()
+        # ==================== Dataset ====================
+        
+        # ==================== ASLLVD_Skeleton3D ====================
+        self.DATASET_NAME = "ASL3DWord"
+        self.ROOT_DIR ='/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/data/ASL3DWord'
+        # self.ROOT_DIR ='/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/data/synthetic_smplx_data'
+        
+
+        # ==================== Data Dimensions ====================
+
+        # self.INPUT_DIM = 159 # for dataset v1
+        # self.INPUT_DIM = 264 # for dataset v2
+        
+        self.MAX_SEQ_LEN = 100
+        
+        # Sequence interpolation (original data has only 2-4 frames per sample)
+        self.TARGET_SEQ_LEN = 60  # Target sampling sequence length
+        self.INTERPOLATE_SHORT_SEQ = False  # Whether to interpolate short sequences
+                
+        # ==================== Model Architecture ====================
+        self.LATENT_DIM = 256
+        self.MODEL_DIM = 512
+        self.N_HEADS = 8
+        self.N_LAYERS = 4
+        self.DROPOUT = 0.1
+        
+        # ==================== Training ====================
+        self.TRAIN_BSZ = 100
+        self.EVAL_BSZ = 100
+        
+        self.MODEL_VERSION = 'v5'
+        self.DATASET_VERSION = 'v1'
+
+        self.USE_ROT6D = False
+        self.USE_UPPER_BODY = True
+        

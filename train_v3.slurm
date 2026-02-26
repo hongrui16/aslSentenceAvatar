@@ -35,14 +35,22 @@ echo "Random port: $PORT"
 #     --machine_rank=0 \
 #     --main_process_ip=localhost \
 #     --main_process_port=$PORT \
-#     train_v3.py  --dataset WLASL_SMPLX  --use_mini_dataset --use_upper_body --use_rot6d
+#     train_v3.py  --dataset ASL3DWord  --use_mini_dataset --use_upper_body --use_rot6d
 
 accelerate launch --num_processes=1 \
     --num_machines=1 \
     --machine_rank=0 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
-    train_v3.py  --dataset SignBank_SMPLX  --use_upper_body
+    train_v3.py  --dataset ASL3DWord  --use_rot6d  --use_upper_body
+#  --use_upper_body
+
+# accelerate launch --num_processes=1 \
+#     --num_machines=1 \
+#     --machine_rank=0 \
+#     --main_process_ip=localhost \
+#     --main_process_port=$PORT \
+#     train_v3.py  --dataset ASL3DWord  --use_upper_body --use_mini_dataset
 
 #--use_lebel_index_cond
 # --use_rot6d

@@ -249,8 +249,11 @@ class ASL3DWordDataset(Dataset):
                 seq = seq[idx_sub]
                 actual_len = self.target_seq_len
             elif actual_len < self.target_seq_len:
-                pad = torch.zeros(self.target_seq_len - actual_len, self.input_dim)
-                seq = torch.cat([seq, pad], dim=0)
+                # pad = torch.zeros(self.target_seq_len - actual_len, self.input_dim)
+                # seq = torch.cat([seq, pad], dim=0)
+                last_frame = seq[-1:].expand(self.target_seq_len - actual_len, -1)
+                seq = torch.cat([seq, last_frame], dim=0)
+
 
             return seq, gloss, actual_len
         except Exception as e:

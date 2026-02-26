@@ -48,8 +48,8 @@ root(0) → spine1(3) → spine2(6) → spine3(9) → neck(12) → head(15)
                                               → L_collar(13) → L_shoulder(16) → L_elbow(18) → L_wrist(20) → L_hand...
 '''
 ROOT_INDICES = [0] ## control the whole body rotation
-LOWER_BODY_INDICES = [1, 2, 3, 4, 5, 7, 8, 10, 11]
-TORSO_INDICES      = [6, 9, 12, 13, 14, 15]
+LOWER_BODY_INDICES = [1, 2, 4, 5, 7, 8, 10, 11]
+TORSO_INDICES      = [3, 6, 9, 12, 13, 14, 15]
 ARMS_INDICES       = [16, 17, 18, 19, 20, 21]
 BODY_INDICES       = list(range(22))
 LHAND_INDICES      = list(range(22, 37))
@@ -57,7 +57,7 @@ RHAND_INDICES      = list(range(37, 52))
 JAW_INDICES        = [52]
 ALL_INDICES        = [i for i in range(53)]
 
-REMOVE_INDICES = set(LOWER_BODY_INDICES)
+REMOVE_INDICES = set(LOWER_BODY_INDICES + JAW_INDICES)
 UPPER_BODY_INDICES = [i for i in ALL_53_JOINTS if i not in REMOVE_INDICES]
 
 

@@ -89,12 +89,30 @@
 
 
 
-python generate_smplx_param.py \
---glosses drink before go cool thin \
---render_mesh \
---dataset_name WLASL_SMPLX \
---checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/WLASL_SMPLX/20260219_142051_job5764071/best_model.pt \
---use_mini_dataset \
---use_upper_body \
---use_rot6d
+# python generate_smplx_param.py \
+# --glosses drink before go cool thin \
+# --render_mesh \
+# --dataset_name WLASL_SMPLX \
+# --checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/WLASL_SMPLX/20260219_142051_job5764071/best_model.pt \
+# --use_mini_dataset \
+# --use_upper_body \
+# --use_rot6d
 
+
+
+# --glosses bowling deaf drink no now \
+
+python generate_smplx_param.py \
+--render_mesh \
+--dataset_name ASL3DWord \
+--checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/ASL3DWord/20260225_015009_job5970263/best_model.pt \
+--use_upper_body 
+
+
+# python generate_smplx_param.py \
+# --glosses bowling deaf drink no now \
+# --render_mesh \
+# --dataset_name ASL3DWord \
+# --checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/ASL3DWord/20260225_015109_job5970299/best_model.pt \
+# --use_mini_dataset \
+# --use_upper_body 
