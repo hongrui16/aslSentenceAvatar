@@ -48,12 +48,15 @@ Adding phonological attribute conditioning causes model-based FID to double (127
 
 Despite poor gloss-level metrics, the attribute-conditioned model achieves the best variance ratios for hands and arms (0.83–0.84 vs. gloss-only's 1.29–1.47 and SignAvatar's 0.49–0.62). This suggests that phonological attributes successfully modulate motion amplitude at the articulatory level, but at the cost of gloss identity.
 
-### 4. Likely Cause: Shared Attributes Collapse Gloss Identity
+### 4. Likely Causes of Attribute Conditioning Failure
 
-Phonological attributes are shared across many glosses. The model likely over-relies on attribute signals while discarding gloss-specific information, causing different glosses with similar attribute profiles to produce nearly identical motions.
+**Noisy attribute–video alignment.** ASL-LEX 2.0 provides phonological attributes for one canonical form of each sign, but WLASL contains multiple signing variants per gloss (different handshapes, locations, or movement patterns performed by different signers). Only a subset of videos actually match the ASL-LEX attributes. This creates a label noise problem: the model receives the same attribute conditioning for videos with genuinely different phonological realizations, directly undermining the conditioning signal.
+
+**Shared attributes collapse gloss identity.** Phonological attributes are shared across many glosses. The model likely over-relies on attribute signals while discarding gloss-specific information, causing different glosses with similar attribute profiles to produce nearly identical motions.
 
 ### Potential Directions
 
+- Filter or re-annotate WLASL videos to identify the subset that matches ASL-LEX 2.0 canonical forms, or use soft/probabilistic attribute labels to account for variant diversity
 - Preserve gloss embedding as the primary condition; inject attributes as auxiliary/additive signals rather than replacements
 - Add a gloss classification auxiliary loss to enforce discriminability in the latent space
 - Investigate the conditioning fusion mechanism (e.g., cross-attention or FiLM for hierarchical injection)
