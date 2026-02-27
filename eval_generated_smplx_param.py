@@ -247,9 +247,15 @@ def render_smplx_frame(vertices, faces, img_w=512, img_h=512,
 
 def process_a_gloss(model, gloss, output_dir, seq_len, device,
                     smpl_x=None, img_size=512, dump_param=False,
-                    cfg=None, make_gif=True, gif_fps=8):
+                    cfg=None, make_gif=True, gif_fps=8, dataset = None):
 
-    motion = generate_from_gloss(model, gloss, seq_len, device, cfg)
+                
+    if cfg.USE_PHONO_ATTRIBUTE:
+        gloss_with_attributes = dataset._gloss_with_phono(gloss)
+    else:
+        gloss_with_attributes = gloss
+        
+    motion = generate_from_gloss(model, gloss_with_attributes, seq_len, device, cfg)
     T = motion.shape[0]
 
     gloss_dir = os.path.join(output_dir, gloss)
@@ -317,7 +323,11 @@ def make_collate_fn(gloss_to_idx):
         # batch_list: list of (seq_tensor, gloss_str, actual_len)
         seqs = [item[0] for item in batch_list]       # list of (T, input_dim)
         glosses = [item[1] for item in batch_list]     # list of str
-        lengths = [item[2] for item in batch_list]     # list of int
+        gloss_with_attributes = [item[2] for item in batch_list]     # list of str
+        
+        lengths = len(seqs)
+        
+        # motion, gloss, gloss_with_attributes = batch
 
         # Stack sequences (already padded to target_seq_len by dataset)
         x = torch.stack(seqs, dim=0)  # (B, T, input_dim)
@@ -453,7 +463,6 @@ def run_evaluation(model, cfg, device, train_dataset, test_dataset,
         print(f"    Removing {n_removed} test samples with unknown glosses")
         gt_test_x = gt_test_x[valid_mask]
         gt_test_y = gt_test_y[valid_mask]
-
     print("\n>>> Generating motions for test set ...")
     gen_test_x, gen_test_y_raw = collect_gen_motions(
         model, test_dataset, cfg, device, batch_size)
@@ -568,6 +577,7 @@ def main(args):
     cfg.USE_MINI_DATASET  = args.use_mini_dataset
     cfg.ROOT_NORMALIZE    = not args.no_root_normalize
     cfg.N_FEATS           = 6 if cfg.USE_ROT6D else 3
+    cfg.USE_PHONO_ATTRIBUTE = args.use_phono_attribute
 
     # ---- Dataset ----
     train_dataset = load_dataset(args.dataset_name, cfg, mode='train')
@@ -599,7 +609,7 @@ def main(args):
     if args.output_dir is None:
         checkpoint_dir = os.path.dirname(args.checkpoint)
         logging_dir = checkpoint_dir.replace(
-            '/scratch/rhong5/weights/temp_training_weights',
+            '/scratch/rhong5/weights/temp_training_weights/aslAvatar',
             '/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/zlog')
         os.makedirs(logging_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -636,6 +646,7 @@ def main(args):
                 cfg=cfg,
                 make_gif=args.gif,
                 gif_fps=args.gif_fps,
+                dataset=train_dataset,
             )
         print(f"\nDone! {len(glosses)} glosses, {total} frames -> {output_dir}")
 
@@ -739,6 +750,7 @@ if __name__ == "__main__":
                         help="Skip generation, only run evaluation")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for evaluation data loading")
+    parser.add_argument("--use_phono_attribute", action="store_true", default=False)
 
     # General
     parser.add_argument("--seed", type=int, default=42)

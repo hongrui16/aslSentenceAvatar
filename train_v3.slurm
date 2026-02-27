@@ -42,7 +42,7 @@ accelerate launch --num_processes=1 \
     --machine_rank=0 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
-    train_v3.py  --dataset ASL3DWord  --use_rot6d  --use_upper_body
+    train_v3.py  --dataset ASL3DWord  --use_rot6d  --use_upper_body --use_phono_attribute
 #  --use_upper_body
 
 # accelerate launch --num_processes=1 \

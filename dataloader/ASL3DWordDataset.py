@@ -51,12 +51,24 @@ import numpy as np
 from torch.utils.data import Dataset
 import sys
 import pickle
+import csv
 
 if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     
 from utils.rotation_conversion import axis_angle_to_rot6d, rot6d_to_axis_angle
 from utils.rotation_conversion import ALL_53_JOINTS, UPPER_BODY_INDICES, LOWER_BODY_INDICES, REMOVE_INDICES, FULL_JOINT_NAMES, ALL_INDICES
+
+# Phonological attributes from ASL-LEX 2.0
+PHONO_ATTRIBUTES = [
+    'Handshape',
+    'Sign Type',
+    'Path Movement',
+    'Major Location',
+    'Minor Location',
+    'Second Minor Location',
+    'Nondominant Handshape',
+]
 
 # ============================================================================
 # Dataset
@@ -100,14 +112,15 @@ class ASL3DWordDataset(Dataset):
         self.target_seq_len = getattr(cfg, 'TARGET_SEQ_LEN', 40) if cfg else 40
         self.use_mini_dataset = getattr(cfg, 'USE_MINI_DATASET', False) if cfg else False
         self.mini_top_k = getattr(cfg, 'MINI_TOP_K', 5) if cfg else 5
+        self.use_phono_attribute = getattr(cfg, 'USE_PHONO_ATTRIBUTE', False) if cfg else False
+
         self.min_frames = 5
         self.root_dir = getattr(cfg, 'ROOT_DIR', './ASL3DWord') if cfg else './ASL3DWord'
-
+        self.asl_lex_path = getattr(cfg, 'ASL_LEX_PATH', './data/ASL_LEX2.0/ASL-LEX_View_Data.csv') if cfg else './data/ASL_LEX2.0/ASL-LEX_View_Data.csv'
         # Compute dimensions
         self.n_joints = len(ALL_INDICES)
         self.n_feats = 6 if self.use_rot6d else 3
         self.input_dim = self.n_joints * self.n_feats
-
 
         # Joint indices to use
         # self.joint_indices = UPPER_BODY_INDICES if self.use_upper_body else ALL_53_JOINTS
@@ -120,6 +133,13 @@ class ASL3DWordDataset(Dataset):
         self.gloss_to_idx = {}   # {gloss_name: int}
         self.gloss_name_list = []
         
+                # Phonological attribute lookup: {gloss_lower: {attr_name: attr_value, ...}}
+        self.phono_lookup = {}
+        self.phono_vocab = {}     # {attr_name: {attr_value: int}}
+        if self.use_phono_attribute:
+            self._load_phono_attributes()
+
+
         self._load_all_samples()
         if self.logger is not None:
             self.logger.info(f"[{mode}] Config: rot6d={self.use_rot6d}, upper_body={self.use_upper_body}, "
@@ -127,7 +147,51 @@ class ASL3DWordDataset(Dataset):
 
     # ==================== Initialization ====================
 
-            
+    def _load_phono_attributes(self):
+        """
+        Load phonological attributes from ASL-LEX 2.0 CSV.
+        Builds self.phono_lookup: {gloss_lower: {attr_name: attr_value_str, ...}}
+        """
+        if not os.path.exists(self.asl_lex_path):
+            raise FileNotFoundError(f"ASL-LEX CSV not found: {self.asl_lex_path}")
+
+        with open(self.asl_lex_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                gloss = row['Entry ID'].strip().lower()
+                attrs = {}
+                for attr in PHONO_ATTRIBUTES:
+                    attrs[attr] = row[attr].strip()
+                self.phono_lookup[gloss] = attrs
+
+        if self.logger is not None:
+            self.logger.info(f"[Phono] Loaded {len(self.phono_lookup)} glosses from ASL-LEX")
+
+    def _gloss_with_phono(self, gloss):
+        attrs = self.phono_lookup.get(gloss, None)
+        if attrs is None:
+            return gloss
+        
+        attr_labels = {
+            'Handshape': 'handshape',
+            'Sign Type': 'sign type',
+            'Path Movement': 'movement',
+            'Major Location': 'location',
+            'Minor Location': 'minor location',
+            'Second Minor Location': 'second minor location',
+            'Nondominant Handshape': 'nondominant handshape',
+        }
+        
+        parts = [f"gloss: {gloss}"]
+        for attr in PHONO_ATTRIBUTES:
+            val = attrs[attr]
+            if val == 'N/A':
+                val = 'none'
+            parts.append(f"{attr_labels[attr]}: {val.lower()}")
+        
+        return ', '.join(parts)
+
+
     def _load_all_samples(self):
         split_dir = os.path.join(self.root_dir, self.mode)
         label_path = os.path.join(split_dir, 'samples_label.pkl')
@@ -238,6 +302,9 @@ class ASL3DWordDataset(Dataset):
     def __getitem__(self, idx):
         try:
             gloss, pose = self.data_list[idx]
+            
+            # Append phonological attributes to gloss string if enabled
+            gloss_with_attributes = self._gloss_with_phono(gloss) if self.use_phono_attribute else gloss
 
             # pose: (T, 53, 3) numpy array
             seq = self._process_sequence(pose)  # (T, input_dim)
@@ -253,15 +320,15 @@ class ASL3DWordDataset(Dataset):
                 # seq = torch.cat([seq, pad], dim=0)
                 last_frame = seq[-1:].expand(self.target_seq_len - actual_len, -1)
                 seq = torch.cat([seq, last_frame], dim=0)
-
-
-            return seq, gloss, actual_len
+                
+            return seq, gloss, gloss_with_attributes
+        
         except Exception as e:
             if self.logger is not None:
                 self.logger.info(f"[ERROR] __getitem__ idx={idx}, error={e}")
             import traceback
             traceback.print_exc()
-            return torch.zeros(self.target_seq_len, self.input_dim), "unknown", 1
+            return torch.zeros(self.target_seq_len, self.input_dim), "unknown", "unknown"
 
 
     # ==================== Inverse Conversion (for generation / visualization) ====================
@@ -353,3 +420,7 @@ class ASL3DWordDataset(Dataset):
     def get_removed_joint_names():
         """Return list of removed (lower body + jaw) joint names."""
         return [FULL_JOINT_NAMES[i] for i in sorted(REMOVE_INDICES)]
+
+
+if __name__ == "__main__":
+    pass

@@ -73,6 +73,8 @@ class BaseConfig:
         
         self.N_JOINTS = 53
         self.N_FEATS = 3
+        self.USE_PHONO_ATTRIBUTE = False
+        
 
 class ASLLVD_Skeleton3D_Config(BaseConfig):
     """Training configuration"""

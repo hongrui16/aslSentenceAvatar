@@ -70,6 +70,7 @@ class DiffusionTrainer:
         self.cfg.PROJECT_NAME = "ASLAvatar_Diffusion"
         self.cfg.ROOT_NORMALIZE = not args.no_root_normalize
         self.cfg.MODEL_VERSION = 'v5'
+        self.cfg.USE_PHONO_ATTRIBUTE = args.use_phono_attribute
 
         # Diffusion-specific config with defaults
         self.cfg.NUM_DIFFUSION_STEPS = getattr(self.cfg, 'NUM_DIFFUSION_STEPS', 1000)
@@ -260,6 +261,7 @@ class DiffusionTrainer:
         RHAND      = joint_groups['RHAND']
         JAW        = joint_groups['JAW']
         
+        
         # Weighted reconstruction
         mse_loss = (0.5 * masked_mse(x_0_pred[..., TORSO],  x_0[..., TORSO])
                   + 0.0 * masked_mse(x_0_pred[..., ROOT],  x_0[..., ROOT])
@@ -287,6 +289,8 @@ class DiffusionTrainer:
                   + 5.0 * masked_vel(vel_pred[..., RHAND], vel_gt[..., RHAND])
                   + 0.1 * masked_vel(vel_pred[..., JAW],   vel_gt[..., JAW]))
 
+
+
         total = mse_loss + self.cfg.VEL_WEIGHT * vel_loss
         return total, mse_loss, vel_loss
 
@@ -312,9 +316,9 @@ class DiffusionTrainer:
                 progress_bar.update(1)
 
             with self.accelerator.accumulate(self.model):
-                motion, gloss, lengths = batch
+                motion, gloss, gloss_with_attributes = batch
                 B, T, _ = motion.shape
-
+                lengths = torch.full((B,), T, device=motion.device, dtype=torch.long)
                 # Condition
                 if self.cfg.USE_LABEL_INDEX_COND:
                     cond = torch.tensor(
@@ -381,9 +385,11 @@ class DiffusionTrainer:
 
         for batch in tqdm(self.test_loader, desc="Evaluating",
                           disable=not self.accelerator.is_local_main_process):
-            motion, gloss, lengths = batch
+            motion, gloss, gloss_with_attributes = batch
             B, T, _ = motion.shape
-
+            
+            lengths = torch.full((B,), T, dtype=torch.long)
+            # print(gloss[0])
             if self.cfg.USE_LABEL_INDEX_COND:
                 cond = torch.tensor(
                     [self.cfg.GLOSS_NAME_LIST.index(gl) for gl in gloss],
@@ -566,6 +572,8 @@ def parse_args():
     parser.add_argument("--use_mini_dataset", action="store_true", default=False)
     parser.add_argument("--use_label_index_cond", action="store_true", default=False)
     parser.add_argument("--no_root_normalize", action="store_true", default=False)
+    parser.add_argument("--use_phono_attribute", action="store_true", default=False)
+    
     return parser.parse_args()
 
 
@@ -573,3 +581,4 @@ if __name__ == "__main__":
     args = parse_args()
     trainer = DiffusionTrainer(args)
     trainer.train()
+    

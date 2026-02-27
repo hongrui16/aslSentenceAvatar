@@ -270,9 +270,15 @@ def render_smplx_frame(vertices, faces, img_w=512, img_h=512,
 # Process one gloss
 # =============================================================================
 def process_a_gloss(model, gloss, output_dir, seq_len, device,
-                  smpl_x=None, img_size=512, dump_param = False, cfg = None, make_gif=True, gif_fps=8):
-    
-    motion = generate_from_gloss(model, gloss, seq_len, device, cfg)  # (T, 159)
+                  smpl_x=None, img_size=512, dump_param = False, 
+                        cfg=None, make_gif=True, gif_fps=8, dataset = None):
+
+    if cfg.USE_PHONO_ATTRIBUTE:
+        gloss_str = dataset._gloss_with_phono(gloss)
+    else:
+        gloss_str = gloss
+        
+    motion = generate_from_gloss(model, gloss_str, seq_len, device, cfg)  # (T, 159)
     print('motion.shape', motion.shape, 'cfg.N_FEATS', cfg.N_FEATS)
     T = motion.shape[0]
 
@@ -390,6 +396,7 @@ def main(args):
     cfg.USE_LABEL_INDEX_COND= args.use_label_index_cond
     cfg.ROOT_NORMALIZE = not args.no_root_normalize
     cfg.N_FEATS = 6 if cfg.USE_ROT6D else 3
+    cfg.USE_PHONO_ATTRIBUTE = args.use_phono_attribute
     
     if args.output_dir is None:
         checkpoint_dir = os.path.dirname(args.checkpoint)        
@@ -497,7 +504,7 @@ def main(args):
             cfg = cfg,
             # make_gif=args.gif,
             gif_fps=args.gif_fps,
-
+            dataset=train_dataset,
         )
 
 
@@ -524,6 +531,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_root_normalize", action="store_true", default=False, help="Disable root pose normalization (subtract first frame root)")
     parser.add_argument("--gif", action="store_true", help="Generate animated GIF per gloss (requires --render_mesh)")
     parser.add_argument("--gif_fps", type=int, default=8, help="GIF frame rate (default: 10)")
+    parser.add_argument("--use_phono_attribute", action="store_true", default=False)
 
 
     parser.add_argument("--seed", type=int, default=42)
