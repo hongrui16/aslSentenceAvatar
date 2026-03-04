@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --partition=contrib-gpuq                    # need to set 'gpuq' or 'contrib-gpuq'  partition
 #SBATCH --qos=gpu                           # need to select 'gpu' QOS or other relevant QOS
-#SBATCH --job-name=upd                   # vqgan, vqvae, vqdiffusion, gaussiandiffusion
-#SBATCH --output=./zlog/%x-%N-%j.out   # Output file
-#SBATCH --error=./zlog/%x-%N-%j.err    # Error file
+#SBATCH --job-name=det                   # vqgan, vqvae, vqdiffusion, gaussiandiffusion
+#SBATCH --output=/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/zlog/%x-%N-%j.out   # Output file
+#SBATCH --error=/home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/zlog/%x-%N-%j.err    # Error file
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1                # number of cores needed
 #SBATCH --mem=20gb                # 100gb for InterHand26M, memory per CORE; total memory is 1 TB (1,000,000 MB), 
@@ -31,9 +31,9 @@ cd /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/
 # python InterHand26M.py --split val
 # python InterHand26M.py --split test
 
-# python /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/detect_pose.py
+python -u /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/detect_pose.py
 
-sh update_timestamp.sh /scratch/rhong5/dataset/InterHand
+# sh update_timestamp.sh /scratch/rhong5/dataset/InterHand
 
 # torchrun --nnodes=${NUM_NODES} --nproc_per_node=${GPUS_PER_NODE} train_VAE.py --debug 
 
