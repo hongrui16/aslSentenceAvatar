@@ -76,6 +76,8 @@ class DiffusionTrainer:
         self.cfg.NUM_DIFFUSION_STEPS = getattr(self.cfg, 'NUM_DIFFUSION_STEPS', 1000)
         self.cfg.VEL_WEIGHT = getattr(self.cfg, 'VEL_WEIGHT', 1.0)
         self.cfg.N_FEATS = 6 if self.cfg.USE_ROT6D else 3
+        
+        self.cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
 
         if args.batch_size:
             self.cfg.TRAIN_BSZ = args.batch_size
@@ -573,6 +575,7 @@ def parse_args():
     parser.add_argument("--use_label_index_cond", action="store_true", default=False)
     parser.add_argument("--no_root_normalize", action="store_true", default=False)
     parser.add_argument("--use_phono_attribute", action="store_true", default=False)
+    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5"])
     
     return parser.parse_args()
 

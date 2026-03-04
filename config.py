@@ -75,6 +75,8 @@ class BaseConfig:
         self.N_FEATS = 3
         self.USE_PHONO_ATTRIBUTE = False
         
+        self.TEXT_ENCODER_TYPE = 'clip'
+        
 
 class ASLLVD_Skeleton3D_Config(BaseConfig):
     """Training configuration"""

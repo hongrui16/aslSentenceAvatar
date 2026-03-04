@@ -15,22 +15,23 @@
 
 ## Main Results
 
-| Metric | SignAvatar (ep5000) | Diff. Gloss-only (ep407) | Diff. Gloss+Attri (ep457) |
-|--------|--------------------:|-------------------------:|--------------------------:|
-| **Model-based FID ↓** | 62.23 | **62.44** | 127.95 |
-| **Model-based Accuracy ↑** | 0.758 | **0.838** ✓ | 0.201 ✗ |
-| **KNN Accuracy ↑** | 0.271 | **0.378** ✓ | 0.097 ✗ |
-| **Diversity** (GT=27.57) | 25.63 | **27.44** ≈ GT | 26.61 |
-| **Multimodality** (GT=11.68) | 10.06 | 9.33 | **12.67** ≈ GT |
+| Metric | SignAvatar (ep5000) | Diff. Gloss-only (ep407) | Diff. Gloss+Attri CLIP (ep457) | Diff. Gloss+Attri T5 (ep473) |
+|--------|--------------------:|-------------------------:|-------------------------------:|-----------------------------:|
+| **Model-based FID ↓** | 62.23 | **62.44** | 127.95 | 63.66 |
+| **Model-based Accuracy ↑** | 0.758 | **0.838** ✓ | 0.201 ✗ | 0.525 |
+| **KNN Accuracy ↑** | 0.271 | **0.378** ✓ | 0.097 ✗ | 0.310 |
+| **Diversity** (GT=27.57) | 25.63 | **27.44** ≈ GT | 26.61 | 27.31 ≈ GT |
+| **Multimodality** (GT=11.68) | 10.06 | 9.33 | **12.67** ≈ GT | 12.23 ≈ GT |
 
 ## Variance Ratio (ideal = 1.0)
 
-| Body Part | SignAvatar | Diff. Gloss-only | Diff. Gloss+Attri |
-|-----------|----------:|------------------:|-------------------:|
-| Arms      | 0.620     | 1.289             | **0.750**          |
-| L-Hand    | 0.495     | 1.470             | **0.837**          |
-| R-Hand    | 0.622     | 1.348             | **0.835**          |
-| Torso     | 0.675     | **0.756**         | 0.579              |
+| Body Part | SignAvatar | Diff. Gloss-only | Diff. Gloss+Attri CLIP | Diff. Gloss+Attri T5 |
+|-----------|----------:|------------------:|-----------------------:|---------------------:|
+| Arms      | 0.620     | 1.289             | **0.750**              | 1.286                |
+| L-Hand    | 0.495     | 1.470             | **0.837**              | 1.346                |
+| R-Hand    | 0.622     | 1.348             | **0.835**              | 1.283                |
+| Torso     | 0.675     | **0.756**         | 0.579                  | 0.712                |
+
 
 ---
 
@@ -48,7 +49,12 @@ Adding phonological attribute conditioning causes model-based FID to double (127
 
 Despite poor gloss-level metrics, the attribute-conditioned model achieves the best variance ratios for hands and arms (0.83–0.84 vs. gloss-only's 1.29–1.47 and SignAvatar's 0.49–0.62). This suggests that phonological attributes successfully modulate motion amplitude at the articulatory level, but at the cost of gloss identity.
 
-### 4. Likely Causes of Attribute Conditioning Failure
+### 4. T5 Encoder Substantially Recovers from CLIP's Attribute Conditioning Failure
+
+Replacing the CLIP text encoder with T5 while keeping everything else identical brings model-based FID back to baseline level (63.66 vs. CLIP's 127.95), and partially recovers accuracy (0.525 vs. CLIP's 0.201) and KNN accuracy (0.310 vs. CLIP's 0.097). However, both metrics still fall short of the gloss-only model (0.838 accuracy, 0.378 KNN). Variance ratios shift to match the gloss-only pattern (~1.28–1.35) rather than the CLIP attribute model's closer-to-1.0 values. This suggests CLIP's pretrained visual-language alignment may actively interfere with encoding structured phonological attributes, while T5 provides a cleaner text representation — though the fundamental noisy-alignment issue still limits attribute conditioning effectiveness.
+
+
+### 5. Likely Causes of Attribute Conditioning Failure
 
 **Noisy attribute–video alignment.** ASL-LEX 2.0 provides phonological attributes for one canonical form of each sign, but WLASL contains multiple signing variants per gloss (different handshapes, locations, or movement patterns performed by different signers). Only a subset of videos actually match the ASL-LEX attributes. This creates a label noise problem: the model receives the same attribute conditioning for videos with genuinely different phonological realizations, directly undermining the conditioning signal.
 

@@ -578,6 +578,7 @@ def main(args):
     cfg.ROOT_NORMALIZE    = not args.no_root_normalize
     cfg.N_FEATS           = 6 if cfg.USE_ROT6D else 3
     cfg.USE_PHONO_ATTRIBUTE = args.use_phono_attribute
+    cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
 
     # ---- Dataset ----
     train_dataset = load_dataset(args.dataset_name, cfg, mode='train')
@@ -751,6 +752,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for evaluation data loading")
     parser.add_argument("--use_phono_attribute", action="store_true", default=False)
+    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5"])
 
     # General
     parser.add_argument("--seed", type=int, default=42)

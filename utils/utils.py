@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import numpy as np
 # Plot training curves
+from shapely import length
 from torch.nn.utils.rnn import pad_sequence
 import torch
 
@@ -108,13 +109,13 @@ def collate_fn(batch):
     Returns:
         poses_padded: (B, max_T, D) - padded pose sequences
         labels: List[str] - gloss labels
-        lengths: (B,) - actual lengths
+        gloss_with_attributes: List[str] - gloss labels with attributes
     """
-    poses, labels, lengths = zip(*batch)
+    poses, labels, gloss_with_attributes = zip(*batch)
     
     # Pad sequences to max length in batch
     poses_padded = pad_sequence(poses, batch_first=True, padding_value=0.0)
-    
+    lengths = len(poses)
     # Convert lengths to tensor
     lengths_tensor = torch.tensor(lengths, dtype=torch.long)
     
@@ -133,6 +134,7 @@ def create_padding_mask(lengths, max_len, device):
     Returns:
         mask: (B, max_len) - True where padded
     """
+    lengths = lengths.to(device)
     B = lengths.shape[0]
     indices = torch.arange(max_len, device=device).expand(B, -1)
     mask = indices >= lengths.unsqueeze(1)

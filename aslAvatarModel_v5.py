@@ -4,7 +4,9 @@ ASL Avatar Motion Diffusion Model (V5)
 
 MDM-style (Motion Diffusion Model) architecture for sign language generation.
 Replaces CVAE with diffusion for better temporal dynamics.
-
+Now supports switchable text encoders via cfg.TEXT_ENCODER_TYPE:
+    - "clip"  (default) — CLIP ViT-B/32 pooler output
+    - "t5"              — T5-base encoder, mean-pooled hidden states
 Architecture:
     Denoiser = Transformer Encoder over [timestep_token, cond_token, motion_tokens...]
     
@@ -30,6 +32,10 @@ import torch
 import torch.nn as nn
 import math
 from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import (
+    CLIPTokenizer, CLIPTextModel,
+    T5Tokenizer, T5EncoderModel,
+)
 
 from utils.rotation_conversion import LOWER_BODY_INDICES, ROOT_INDICES, TORSO_INDICES, ALL_INDICES, get_joint_slices
 # =============================================================================
@@ -74,8 +80,11 @@ class PositionalEncoding(nn.Module):
 
 class MotionDiffusionModel(nn.Module):
     """
-    MDM-style Motion Diffusion Model.
+    MDM-style Motion Diffusion Model with switchable text encoder.
     
+    cfg.TEXT_ENCODER_TYPE:
+        "clip"  — CLIPTextModel, pooler_output (512-d)
+        "t5"    — T5EncoderModel, mean-pooled last_hidden_state (768-d for t5-base)
     Denoiser architecture (Transformer Encoder):
         Input sequence: [timestep_token, condition_token, motion_token_1, ..., motion_token_T]
         Self-attention over all tokens → extract motion tokens → output projection
@@ -119,24 +128,49 @@ class MotionDiffusionModel(nn.Module):
 
         # ==================== 1. Condition Module ====================
         self.use_label_index = getattr(cfg, 'USE_LABEL_INDEX_COND', False)
+        self.text_encoder_type = getattr(cfg, 'TEXT_ENCODER_TYPE', 'clip').lower()
 
         if self.use_label_index:
             self.label_embedding = nn.Embedding(cfg.NUM_CLASSES, cfg.MODEL_DIM)
-        else:
-            print(f"Loading CLIP model: {cfg.CLIP_MODEL_NAME}...")
-            self.tokenizer = CLIPTokenizer.from_pretrained(cfg.CLIP_MODEL_NAME)
-            self.text_encoder = CLIPTextModel.from_pretrained(cfg.CLIP_MODEL_NAME)
+        elif self.text_encoder_type == 't5':
+            # --- T5 encoder ---
+            t5_name = getattr(cfg, 'T5_MODEL_NAME', 't5-base')
+            print(f"Loading T5 model: {t5_name}...")
+            self.tokenizer = T5Tokenizer.from_pretrained(t5_name)
+            self.text_encoder = T5EncoderModel.from_pretrained(t5_name)
             for param in self.text_encoder.parameters():
                 param.requires_grad = False
             self.text_encoder.eval()
 
+            t5_dim = self.text_encoder.config.d_model  # 768 for t5-base, 1024 for t5-large
             self.condition_proj = nn.Sequential(
-                nn.Linear(cfg.CLIP_DIM, cfg.MODEL_DIM),
+                nn.Linear(t5_dim, cfg.MODEL_DIM),
                 nn.GELU(),
                 nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
                 nn.GELU(),
                 nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
             )
+
+        else:
+            # --- CLIP encoder (default) ---
+            clip_name = getattr(cfg, 'CLIP_MODEL_NAME', 'openai/clip-vit-base-patch32')
+            print(f"Loading CLIP model: {clip_name}...")
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_name)
+            self.text_encoder = CLIPTextModel.from_pretrained(clip_name)
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
+            self.text_encoder.eval()
+
+            clip_dim = getattr(cfg, 'CLIP_DIM', 512)
+            self.condition_proj = nn.Sequential(
+                nn.Linear(clip_dim, cfg.MODEL_DIM),
+                nn.GELU(),
+                nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
+                nn.GELU(),
+                nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
+            )
+
+
 
         # ==================== 2. Timestep Embedding ====================
         self.timestep_proj = nn.Sequential(
@@ -201,13 +235,32 @@ class MotionDiffusionModel(nn.Module):
     def get_condition(self, cond_input, device):
         """
         Encode condition to (B, D_model).
-        cond_input: List[str] for CLIP, or LongTensor (B,) for label index.
+        
+        Routes to the appropriate encoder based on config:
+            - label index  → embedding lookup
+            - t5           → T5 encoder + mean pool + projection
+            - clip         → CLIP encoder + pooler_output + projection
         """
         if self.use_label_index:
             if not isinstance(cond_input, torch.Tensor):
                 cond_input = torch.tensor(cond_input, dtype=torch.long, device=device)
             return self.label_embedding(cond_input.to(device))
+
+        elif self.text_encoder_type == 't5':
+            inputs = self.tokenizer(
+                cond_input, padding=True, truncation=True,
+                max_length=77, return_tensors="pt"
+            ).to(device)
+            with torch.no_grad():
+                encoder_out = self.text_encoder(**inputs)
+                hidden = encoder_out.last_hidden_state          # (B, seq_len, t5_dim)
+                # Mean pool over non-padding tokens
+                attn_mask = inputs['attention_mask'].unsqueeze(-1).float()  # (B, seq_len, 1)
+                pooled = (hidden * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp(min=1e-9)
+            return self.condition_proj(pooled)
+
         else:
+            # CLIP
             inputs = self.tokenizer(
                 cond_input, padding=True, truncation=True,
                 max_length=77, return_tensors="pt"
