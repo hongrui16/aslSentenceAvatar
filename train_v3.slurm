@@ -42,8 +42,9 @@ accelerate launch --num_processes=1 \
     --machine_rank=0 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
-    train_v3.py  --dataset ASL3DWord  --use_rot6d  --use_upper_body --use_phono_attribute --text_encoder_type t5
+    train_v3.py  --dataset ASL3DWord  --use_rot6d  --use_upper_body  --text_encoder_type t5
 #  --use_upper_body
+# --use_phono_attribute
 
 # accelerate launch --num_processes=1 \
 #     --num_machines=1 \

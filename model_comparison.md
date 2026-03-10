@@ -1,4 +1,4 @@
-# Model Comparison: SignAvatar vs. Diffusion (Gloss-only) vs. Diffusion (Gloss + Attribute)
+# Model Comparison: SignAvatar vs. Diffusion Variants
 
 ## Metric Definitions
 
@@ -13,25 +13,49 @@
 
 ---
 
-## Main Results
+## Main Results (vs. Baseline)
 
-| Metric | SignAvatar (ep5000) | Diff. Gloss-only (ep407) | Diff. Gloss+Attri CLIP (ep457) | Diff. Gloss+Attri T5 (ep473) |
-|--------|--------------------:|-------------------------:|-------------------------------:|-----------------------------:|
-| **Model-based FID ↓** | 62.23 | **62.44** | 127.95 | 63.66 |
-| **Model-based Accuracy ↑** | 0.758 | **0.838** ✓ | 0.201 ✗ | 0.525 |
-| **KNN Accuracy ↑** | 0.271 | **0.378** ✓ | 0.097 ✗ | 0.310 |
-| **Diversity** (GT=27.57) | 25.63 | **27.44** ≈ GT | 26.61 | 27.31 ≈ GT |
-| **Multimodality** (GT=11.68) | 10.06 | 9.33 | **12.67** ≈ GT | 12.23 ≈ GT |
+| Metric | SignAvatar (ep5000) | Diff. Gloss-only CLIP (ep407) |
+|--------|--------------------:|------------------------------:|
+| **Model-based FID ↓** | 62.23 | **62.44** |
+| **Model-based Accuracy ↑** | 0.758 | **0.838** ✓ |
+| **KNN Accuracy ↑** | 0.271 | **0.378** ✓ |
+| **Diversity** (GT=27.57) | 25.63 | **27.44** ≈ GT |
+| **Multimodality** (GT=11.68) | 10.06 | 9.33 |
+
+---
+
+## Text Encoder × Conditioning Ablation (2×2)
+
+| Encoder | Conditioning | FID ↓ | Accuracy ↑ | KNN Acc ↑ | Diversity (GT=27.57) | Multimodality (GT=11.68) |
+|---------|-------------|------:|-----------:|----------:|---------------------:|-------------------------:|
+| CLIP | Gloss-only | **62.44** | **0.838** | **0.378** | 27.44 | 9.33 |
+| CLIP | Gloss+Attri | 127.95 | 0.201 | 0.097 | 26.61 | 12.67 |
+| T5 | Gloss-only | 66.70 | 0.496 | 0.304 | 27.22 | 12.18 |
+| T5 | Gloss+Attri | 63.66 | 0.525 | 0.310 | 27.31 | 12.23 |
+
+**Key observations from the 2×2 ablation:**
+
+- **CLIP excels at single-word gloss encoding but catastrophically fails on structured attributes.** Adding attributes causes accuracy to collapse from 0.838 → 0.201 (−76%). CLIP's visual-semantic pretraining is well-suited for common English words ("BOOK", "HOUSE") but maps similar attribute strings to nearby embeddings, destroying fine-grained categorical distinctions.
+- **T5 is weaker for gloss-only but handles attributes gracefully.** T5 gloss-only underperforms CLIP (0.496 vs. 0.838) — single words are not T5's strength. But adding attributes slightly *improves* T5 (0.496 → 0.525), confirming T5 can extract useful signal from structured phonological descriptions.
+- **No single text encoder solves both problems simultaneously.** CLIP wins on gloss identity; T5 wins on attribute integration. This motivates structured tensor conditioning: use an embedding lookup for gloss identity (no text encoder needed) and a separate structured pathway for phonological attributes, avoiding the bottleneck entirely.
+
+---
 
 ## Variance Ratio (ideal = 1.0)
 
-| Body Part | SignAvatar | Diff. Gloss-only | Diff. Gloss+Attri CLIP | Diff. Gloss+Attri T5 |
-|-----------|----------:|------------------:|-----------------------:|---------------------:|
-| Arms      | 0.620     | 1.289             | **0.750**              | 1.286                |
-| L-Hand    | 0.495     | 1.470             | **0.837**              | 1.346                |
-| R-Hand    | 0.622     | 1.348             | **0.835**              | 1.283                |
-| Torso     | 0.675     | **0.756**         | 0.579                  | 0.712                |
+| Body Part | SignAvatar | CLIP Gloss-only | CLIP Gloss+Attri | T5 Gloss-only | T5 Gloss+Attri |
+|-----------|----------:|----------------:|-----------------:|--------------:|---------------:|
+| Arms      | 0.620     | 1.289           | **0.750**        | 1.337         | 1.286          |
+| L-Hand    | 0.495     | 1.470           | **0.837**        | 1.401         | 1.346          |
+| R-Hand    | 0.622     | 1.348           | **0.835**        | 1.262         | 1.283          |
+| Torso     | 0.675     | **0.756**       | 0.579            | 0.774         | 0.712          |
 
+**Variance Ratio observations:**
+
+- SignAvatar consistently under-articulates across all body parts (ratios 0.49–0.68), especially hands.
+- CLIP Gloss+Attri achieves the best hand/arm ratios (0.75–0.84), closest to ideal 1.0. Phonological attributes successfully modulate motion amplitude at the articulatory level — but at the cost of gloss identity.
+- All other diffusion variants show mild over-articulation in hands/arms (1.26–1.47), suggesting this is a characteristic of the diffusion baseline rather than a conditioning effect.
 
 ---
 
@@ -39,31 +63,33 @@
 
 ### 1. Gloss-only Diffusion Already Outperforms SignAvatar
 
-The diffusion baseline with gloss conditioning alone achieves superior gloss discriminability: model-based accuracy of 0.838 vs. SignAvatar's 0.758, and KNN accuracy of 0.378 vs. 0.271. Model-based FID is on par (62.44 vs. 62.23). Diversity closely matches ground truth (27.44 vs. GT 27.57), indicating well-calibrated generation without mode collapse. This establishes a strong baseline before adding phonological conditioning.
+The diffusion baseline with CLIP gloss conditioning achieves superior gloss discriminability: model-based accuracy of 0.838 vs. SignAvatar's 0.758, and KNN accuracy of 0.378 vs. 0.271. Model-based FID is on par (62.44 vs. 62.23). Diversity closely matches ground truth (27.44 vs. GT 27.57), indicating well-calibrated generation without mode collapse. This establishes a strong baseline before adding phonological conditioning.
 
-### 2. Attribute Conditioning Severely Degrades Gloss Discriminability
+### 2. Attribute Conditioning via Text Encoding Degrades Gloss Discriminability
 
-Adding phonological attribute conditioning causes model-based FID to double (127.95), accuracy to drop from 0.838 to 0.201, and KNN accuracy to fall from 0.378 to 0.097. The model has nearly lost the ability to distinguish between different glosses.
+Across both text encoders, adding phonological attributes as concatenated text fails to match the gloss-only CLIP baseline. With CLIP, the degradation is catastrophic (accuracy 0.201); with T5, it is more moderate but still substantial (accuracy 0.525 vs. gloss-only CLIP's 0.838). The condition is funneled through a single 512-d token, forcing gloss identity and phonological attributes to compete for the same representational bottleneck.
 
-### 3. Paradox: Attribute Conditioning Produces Better Per-Body-Part Dynamics
+### 3. Paradox: CLIP Attribute Conditioning Produces Better Per-Body-Part Dynamics
 
-Despite poor gloss-level metrics, the attribute-conditioned model achieves the best variance ratios for hands and arms (0.83–0.84 vs. gloss-only's 1.29–1.47 and SignAvatar's 0.49–0.62). This suggests that phonological attributes successfully modulate motion amplitude at the articulatory level, but at the cost of gloss identity.
+Despite poor gloss-level metrics, the CLIP attribute-conditioned model achieves the best variance ratios for hands and arms (0.75–0.84 vs. gloss-only's 1.29–1.47 and SignAvatar's 0.49–0.62). This suggests phonological attributes successfully modulate motion amplitude at the articulatory level, but at the cost of gloss identity. This paradox also suggests that the CLIP model's "better" variance ratios may partly reflect mode collapse (reduced variation) rather than purely improved articulation control.
 
-### 4. T5 Encoder Substantially Recovers from CLIP's Attribute Conditioning Failure
+### 4. No Text Encoder Can Simultaneously Serve Both Roles
 
-Replacing the CLIP text encoder with T5 while keeping everything else identical brings model-based FID back to baseline level (63.66 vs. CLIP's 127.95), and partially recovers accuracy (0.525 vs. CLIP's 0.201) and KNN accuracy (0.310 vs. CLIP's 0.097). However, both metrics still fall short of the gloss-only model (0.838 accuracy, 0.378 KNN). Variance ratios shift to match the gloss-only pattern (~1.28–1.35) rather than the CLIP attribute model's closer-to-1.0 values. This suggests CLIP's pretrained visual-language alignment may actively interfere with encoding structured phonological attributes, while T5 provides a cleaner text representation — though the fundamental noisy-alignment issue still limits attribute conditioning effectiveness.
+The 2×2 ablation reveals a fundamental tension: CLIP is optimal for encoding gloss identity (single common English words) but collapses structured attribute strings; T5 better preserves attribute distinctions but is weaker on single-word gloss encoding. No text encoder excels at both tasks, because they require fundamentally different representational properties — gloss identity needs a unique embedding per class, while attributes need compositional, dimension-independent encoding.
 
+### 5. Root Causes of Attribute Conditioning Failure
 
-### 5. Likely Causes of Attribute Conditioning Failure
+**Noisy attribute–video alignment.** ASL-LEX 2.0 provides phonological attributes for one canonical citation form of each sign, but WLASL contains multiple signing variants per gloss (different handshapes, locations, or movement patterns performed by different signers). Only a subset of videos actually match the ASL-LEX attributes. This creates a label noise problem: the model receives the same attribute conditioning for videos with genuinely different phonological realizations, directly undermining the conditioning signal.
 
-**Noisy attribute–video alignment.** ASL-LEX 2.0 provides phonological attributes for one canonical form of each sign, but WLASL contains multiple signing variants per gloss (different handshapes, locations, or movement patterns performed by different signers). Only a subset of videos actually match the ASL-LEX attributes. This creates a label noise problem: the model receives the same attribute conditioning for videos with genuinely different phonological realizations, directly undermining the conditioning signal.
+**Shared attributes collapse gloss identity.** Phonological attributes are shared across many glosses. When encoded as text, the model may over-rely on attribute signals while discarding gloss-specific information, causing different glosses with similar attribute profiles to produce nearly identical motions.
 
-**Shared attributes collapse gloss identity.** Phonological attributes are shared across many glosses. The model likely over-relies on attribute signals while discarding gloss-specific information, causing different glosses with similar attribute profiles to produce nearly identical motions.
+**Single-token conditioning bottleneck.** Both gloss identity and phonological attributes are compressed into a single 512-d condition token. This forces two qualitatively different types of information to compete for the same representational capacity.
 
-### Potential Directions
+---
 
-- Filter or re-annotate WLASL videos to identify the subset that matches ASL-LEX 2.0 canonical forms, or use soft/probabilistic attribute labels to account for variant diversity
-- Preserve gloss embedding as the primary condition; inject attributes as auxiliary/additive signals rather than replacements
-- Add a gloss classification auxiliary loss to enforce discriminability in the latent space
-- Investigate the conditioning fusion mechanism (e.g., cross-attention or FiLM for hierarchical injection)
-- Check whether the attribute embedding dimensionality overwhelms the gloss signal
+## Potential Directions
+
+- **Structured tensor conditioning:** Bypass text encoders entirely — use embedding lookup for gloss identity and a separate structured tensor for phonological attributes, each injected through independent pathways (e.g., gloss via token prepending, attributes via FiLM or cross-attention). This avoids the single-token bottleneck and the text encoder mismatch.
+- **Filter or re-annotate WLASL videos** to identify the subset that matches ASL-LEX 2.0 canonical forms, or use soft/probabilistic attribute labels to account for variant diversity.
+- **Add a gloss classification auxiliary loss** to enforce discriminability in the latent space when attribute conditioning is active.
+- **Dual-pathway conditioning architecture:** Separate pathways for gloss and attributes, with gloss as the primary condition and attributes as auxiliary modulation.
