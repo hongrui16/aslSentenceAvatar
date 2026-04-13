@@ -446,6 +446,41 @@ def process_directory(root_dir, asl_lex_csv=None, visualize=False,
         print(f"Visualizations saved to: {vis_dir}")
 
 
+
+
+
+def check_hand_landmarks(folder_path):
+    HAND_KEYS = [
+        'left_hand_landmarks_3d',
+        'left_hand_landmarks_2d',
+        'right_hand_landmarks_3d',
+        'right_hand_landmarks_2d',
+    ]
+
+    json_files = sorted(f for f in os.listdir(folder_path) if f.endswith('.json'))
+    if not json_files:
+        print(f"No JSON files found in: {folder_path}")
+        return
+
+    found_any = False
+    for jf in json_files:
+        path = os.path.join(folder_path, jf)
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        non_empty = {k: data[k] for k in HAND_KEYS if k in data and len(data[k]) > 0}
+        if non_empty:
+            found_any = True
+            print(f"\n[{jf}]")
+            for k, v in non_empty.items():
+                print(f"  {k}: {len(v)} landmarks")
+
+    if not found_any:
+        print("All JSON files have empty hand landmark fields.")
+
+
+
+    
 def main():
     parser = argparse.ArgumentParser(description="MediaPipe Holistic: Pose + Hands Detection")
     parser.add_argument("--root", type=str,
@@ -467,7 +502,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    folder_path = '/scratch/rhong5/dataset/wlasl/video_frame_fitting/keypoints/apple/02999'
+    check_hand_landmarks(folder_path)
     
     
     

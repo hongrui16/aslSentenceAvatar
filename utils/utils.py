@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 import numpy as np
 # Plot training curves
-from shapely import length
+
 from torch.nn.utils.rnn import pad_sequence
 import torch
 
@@ -101,26 +101,13 @@ def backup_code(
 
 def collate_fn(batch):
     """
-    Custom collate function for variable-length sequences.
-    
-    Args:
-        batch: List of (pose_tensor, label, length) tuples
-        
-    Returns:
-        poses_padded: (B, max_T, D) - padded pose sequences
-        labels: List[str] - gloss labels
-        gloss_with_attributes: List[str] - gloss labels with attributes
+    How2SignSMPLXDataset 返回 4-tuple: (seq, sentence, sentence, actual_len)
     """
-    poses, labels, gloss_with_attributes = zip(*batch)
-    
-    # Pad sequences to max length in batch
-    poses_padded = pad_sequence(poses, batch_first=True, padding_value=0.0)
-    lengths = len(poses)
-    # Convert lengths to tensor
-    lengths_tensor = torch.tensor(lengths, dtype=torch.long)
-    
-    return poses_padded, list(labels), lengths_tensor
-
+    seqs, sentence, conds2, lengths = zip(*batch)
+    seqs = torch.stack(seqs, dim=0)                    # (B, T, D)
+    lengths = torch.tensor(lengths, dtype=torch.long)  # (B,)
+    return seqs, list(sentence), list(conds2), lengths
+ 
 
 def create_padding_mask(lengths, max_len, device):
     """

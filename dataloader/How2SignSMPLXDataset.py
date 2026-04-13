@@ -89,7 +89,7 @@ class How2SignSMPLXDataset(Dataset):
 
         # Data storage
         self.data_list = []   # [(sentence_str, pkl_paths_list), ...]
-        self.gloss_name_list = []
+
 
         self._load_all_samples()
 
@@ -108,7 +108,7 @@ class How2SignSMPLXDataset(Dataset):
         if self.camera is not None:
             df = df[df["SENTENCE_NAME"].str.contains(self.camera, na=False)]
 
-        n_missing = n_short = 0
+        n_missing = n_short = n_corrupt = 0
         for _, row in df.iterrows():
             sname    = str(row["SENTENCE_NAME"]).strip()
             stext    = str(row["SENTENCE"]).strip()
@@ -127,6 +127,19 @@ class How2SignSMPLXDataset(Dataset):
                 n_short += 1
                 continue
 
+            # 只验证第一个 pkl，损坏的整个 sentence 直接跳过
+            try:
+                with open(pkls[0], 'rb') as f:
+                    pickle.load(f)
+            except Exception:
+                n_corrupt += 1
+                continue
+
+            # 空句子也跳过
+            if not stext:
+                n_missing += 1
+                continue
+
             self.data_list.append((stext, pkls))
 
         lengths  = np.array([len(d[1]) for d in self.data_list])
@@ -135,11 +148,11 @@ class How2SignSMPLXDataset(Dataset):
 
         if self.logger is not None:
             self.logger.info(f"[{self.mode}] {len(self.data_list)} samples "
-                             f"(missing={n_missing}, short={n_short})")
+                             f"(missing={n_missing}, short={n_short}, corrupt={n_corrupt})")
             self.logger.info(f"[{self.mode}] pad={n_pad}, uniform_sample={n_sample}")
         else:
             print(f"[{self.mode}] {len(self.data_list)} samples "
-                  f"(missing={n_missing}, short<{self.min_frames}={n_short})")
+                  f"(missing={n_missing}, short<{self.min_frames}={n_short}, corrupt={n_corrupt})")
             print(f"[{self.mode}] pad(T<={self.target_seq_len})={n_pad}, "
                   f"uniform_sample(T>{self.target_seq_len})={n_sample}")
 
@@ -257,20 +270,21 @@ class How2SignSMPLXDataset(Dataset):
             seq = self._process_sequence(pose)
             actual_len = seq.shape[0]
 
-            # Pad if shorter than target (only for clips with T < target_seq_len)
+            # 用零填充，不用最后一帧填充
+            # pad last frame 会让模型学到虚假的静止分布
             if actual_len < self.target_seq_len:
-                last_frame = seq[-1:].expand(self.target_seq_len - actual_len, -1)
-                seq = torch.cat([seq, last_frame], dim=0)
+                pad = torch.zeros(self.target_seq_len - actual_len, seq.shape[-1])
+                seq = torch.cat([seq, pad], dim=0)
 
-            # Return same interface as ASL3DWordDataset: (seq, cond, cond)
-            return seq, sentence, sentence
+            # 多返回 actual_len，让 train 里能建正确的 padding_mask
+            return seq, sentence, sentence, actual_len
 
         except Exception as e:
             if self.logger is not None:
                 self.logger.info(f"[ERROR] __getitem__ idx={idx}, error={e}")
             import traceback
             traceback.print_exc()
-            return torch.zeros(self.target_seq_len, self.input_dim), "", ""
+            return torch.zeros(self.target_seq_len, self.input_dim), "", "", 0
 
 
     # ==================== Inverse Conversion (for generation / visualization) ====================

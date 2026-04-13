@@ -102,11 +102,11 @@
 
 # --glosses bowling deaf drink no now \
 
-python generate_smplx_param.py \
---render_mesh \
---dataset_name ASL3DWord \
---checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/ASL3DWord/20260225_015009_job5970263/best_model.pt \
---use_upper_body 
+# python generate_smplx_param.py \
+# --render_mesh \
+# --dataset_name ASL3DWord \
+# --checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/ASL3DWord/20260225_015009_job5970263/best_model.pt \
+# --use_upper_body 
 
 
 # python generate_smplx_param.py \
@@ -116,3 +116,13 @@ python generate_smplx_param.py \
 # --checkpoint  /scratch/rhong5/weights/temp_training_weights/ASLAvatar_Diffusion/ASL3DWord/20260225_015109_job5970299/best_model.pt \
 # --use_mini_dataset \
 # --use_upper_body 
+
+
+python generate_how2sign_smplx_param.py \
+--checkpoint  /scratch/rhong5/weights/temp_training_weights/aslSentenceAvatar/ASLSenAvatar_V1/How2SignSMPLX/20260326_015805_job6621474/best_model.pt \
+--use_rot6d --use_upper_body --model_version v1
+
+
+# python generate_how2sign_smplx_param.py \
+# --checkpoint  /scratch/rhong5/weights/temp_training_weights/aslAvatar/ASLAvatar_Diffusion/How2SignSMPLX/20260323_234247_job6603785/best_model.pt \
+# --use_rot6d --use_upper_body --model_version v1

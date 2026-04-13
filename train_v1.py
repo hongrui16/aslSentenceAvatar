@@ -1,10 +1,13 @@
 """
-ASL Avatar Training Script (V1)
+ASL Avatar Diffusion Training Script (V1)
+
+Trains MotionDiffusionModel (MDM-style) instead of CVAE.
+
 
 Usage:
-    python train.py
-    python train.py --debug
-    python train.py --batch_size 16 --epochs 100
+    python train_v1.py --dataset WLASL_SMPLX --use_rot6d --use_upper_body
+    python train_v1.py --dataset WLASL_SMPLX --use_rot6d --use_upper_body --debug
+    python train_v1.py --dataset WLASL_SMPLX --use_rot6d --use_upper_body --use_mini_dataset
 """
 
 import os
@@ -23,279 +26,438 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 from accelerate.logging import get_logger
 
-from dataloader.ASLLVDDataset import ASLLVDSkeletonDataset
-from dataloader.SignBankSMPLXDataset import SignBankSMPLXDataset
-from dataloader.WLASLSMPLXDataset import WLASLSMPLXDataset
-from dataloader.WLASLSMPLXDatasetV2 import WLASLSMPLXDatasetV2 
-from aslAvatarModel import ASLAvatarModel
-from aslAvatarModel_v2 import ASLAvatarModelV2
-from aslAvatarModel_v3 import ASLAvatarModelV3
+from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
+
+from MotionDiffusionModelV1 import MotionDiffusionModelV1
+from MotionDiffusionModelV2 import MotionDiffusionModelV2
+
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
+from config import How2Sign_SMPLX_Config
+from utils.rotation_conversion import get_joint_slices
 
 
-from config import SignBank_SMPLX_Config, ASLLVD_Skeleton3D_Config, WLASL_SMPLX_Config
 
+class DiffusionTrainer:
+    """Diffusion training with Accelerate support"""
 
-
-class Trainer:
-    """Training worker with Accelerate support"""
-    
     def __init__(self, args):
         self.args = args
-        self.dataset_name = args.dataset
-        if self.dataset_name == "ASLLVD_Skeleton3D":
-            Config = ASLLVD_Skeleton3D_Config
-        elif self.dataset_name == "SignBank_SMPLX":
-            Config = SignBank_SMPLX_Config
-        elif self.dataset_name == "WLASL_SMPLX":
-            Config = WLASL_SMPLX_Config
-        else:
-            raise ValueError(f"Unknown dataset: {self.dataset_name}")
+        self.debug = args.debug
+
+            
+        Config = How2Sign_SMPLX_Config
+        
+
         self.cfg = Config()
-        self.cfg.DATASET_NAME = self.dataset_name
+        self.cfg.DATASET_NAME = args.dataset
         self.cfg.USE_UPPER_BODY = args.use_upper_body
         self.cfg.USE_ROT6D = args.use_rot6d
         self.cfg.USE_MINI_DATASET = args.use_mini_dataset
-        self.cfg.USE_LABEL_INDEX_COND= args.use_lebel_index_cond
+
+        self.cfg.ROOT_NORMALIZE = not args.no_root_normalize
+
+        self.cfg.USE_PHONO_ATTRIBUTE = args.use_phono_attribute
+
+        # Diffusion-specific config with defaults
+        self.cfg.NUM_DIFFUSION_STEPS = getattr(self.cfg, 'NUM_DIFFUSION_STEPS', 1000)
+        self.cfg.VEL_WEIGHT = getattr(self.cfg, 'VEL_WEIGHT', 1.0)
+        self.cfg.N_FEATS = 6 if self.cfg.USE_ROT6D else 3
         
-        self.debug = args.debug
+        self.cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
         
-        # Override config from args
+        self.cfg.MODEL_VERSION = args.model_version
+
         if args.batch_size:
             self.cfg.TRAIN_BSZ = args.batch_size
         if args.epochs:
             self.cfg.MAX_EPOCHS = args.epochs
         if args.lr:
             self.cfg.LEARNING_RATE = args.lr
-            
-        
-        # Setup directories
-        """Create output directories"""
+
+        # ---- Directories ----
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Add SLURM job ID if available
         slurm_id = os.getenv('SLURM_JOB_ID')
         if slurm_id:
             timestamp += f"_job{slurm_id}"
-        
-        if self.args.debug:
+        if self.debug:
             timestamp = "debug_" + timestamp
-        
+
         self.logging_dir = os.path.join(
-            self.cfg.LOG_DIR,
-            self.cfg.PROJECT_NAME,
-            self.cfg.DATASET_NAME,
-            timestamp
+            self.cfg.LOG_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}", self.cfg.DATASET_NAME, timestamp
         )
-        
         if self.debug:
             self.ckpt_dir = self.logging_dir
         else:
             self.ckpt_dir = os.path.join(
-                self.cfg.CKPT_DIR,
-                self.cfg.PROJECT_NAME,
-                self.cfg.DATASET_NAME,
-                timestamp
+                self.cfg.CKPT_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}", self.cfg.DATASET_NAME, timestamp
             )
-        
-        # Initialize Accelerator
-        acc_config = ProjectConfiguration(
-            project_dir=self.logging_dir,
-            logging_dir=self.logging_dir
-        )
-        
-        
+
+        # ---- Accelerator ----
+        acc_config = ProjectConfiguration(project_dir=self.logging_dir, logging_dir=self.logging_dir)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.cfg.GRAD_ACCUM,
             mixed_precision=self.cfg.MIXED_PRECISION,
-            project_config=acc_config
+            project_config=acc_config,
         )
         self.device = self.accelerator.device
-        
-        
-        # Create directories``
-        if self.accelerator.is_main_process:        
+
+        if self.accelerator.is_main_process:
             os.makedirs(self.logging_dir, exist_ok=True)
             os.makedirs(self.ckpt_dir, exist_ok=True)
-        
-        
-        # Setup logging
+
         self._setup_logging()
-        
-        # Build components
         self._build_components()
-        
-        ## backup python files
+
+        # Backup code
         if self.accelerator.is_main_process:
-            # src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
             src_dir = os.path.dirname(os.path.abspath(__file__))
             dst_dir = os.path.join(self.logging_dir, 'code_backup')
             os.makedirs(dst_dir, exist_ok=True)
-            backup_code(
-                project_root=src_dir,
-                backup_dir=dst_dir,
-                logger=self.logger)
-                    
+            backup_code(project_root=src_dir, backup_dir=dst_dir, logger=self.logger)
+
         self.global_step = 0
         self.best_loss = float('inf')
         self.start_epoch = 0
 
-        # Resume from checkpoint if specified
         if args.resume:
             self.load_checkpoint(args.resume, finetune=args.finetune)
-            self.cfg.RESUME = args.resume
-            self.cfg.FINETUNE = args.finetune
 
-                ## print config to log
+        # Log config
         self.logger.info("Config:")
         for k, v in vars(self.cfg).items():
             self.logger.info(f"  {k}: {v}")
         self.logger.info("-------------------------------\n")
 
+    # ================================================================== setup
     def _setup_logging(self):
-        """Configure logging"""
         log_file = os.path.join(self.logging_dir, "train.log")
-        
         handlers = []
         if self.accelerator.is_main_process:
-            handlers = [
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        
+            handlers = [logging.FileHandler(log_file), logging.StreamHandler()]
         logging.basicConfig(
             format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
             level=logging.INFO,
-            handlers=handlers
+            handlers=handlers,
         )
         self.logger = get_logger(__name__)
-        
         if self.accelerator.is_main_process:
-            self.logger.info(f"Logging directory: {self.logging_dir}")
-            self.logger.info(f"Checkpoint directory: {self.ckpt_dir}")
-
-    
-        
+            self.logger.info(f"Logging dir: {self.logging_dir}")
+            self.logger.info(f"Checkpoint dir: {self.ckpt_dir}")
 
     def _build_components(self):
-        """Initialize model, optimizer, and dataloaders"""
         self.logger.info("Building components...")
-        
-        # Datasets
-        self.logger.info("Loading datasets...")
-        if self.cfg.DATASET_NAME == "ASLLVD_Skeleton3D":
-            train_dataset = ASLLVDSkeletonDataset(mode='train', cfg=self.cfg, logger = self.logger)
-            test_dataset = ASLLVDSkeletonDataset(mode='test', cfg=self.cfg, logger = self.logger)
-        elif self.cfg.DATASET_NAME == "SignBank_SMPLX":
-            train_dataset = SignBankSMPLXDataset(mode='train', cfg=self.cfg, logger = self.logger)
-            test_dataset = None  # TODO: implement test dataset for SignBank_SMPLX
-        elif self.cfg.DATASET_NAME == "WLASL_SMPLX":
+
+
+        if self.cfg.DATASET_NAME == "How2SignSMPLX":
             if self.cfg.DATASET_VERSION.lower() == 'v1':
-                train_dataset = WLASLSMPLXDataset(mode='train', cfg=self.cfg, logger = self.logger)
-                test_dataset = WLASLSMPLXDataset(mode='test', cfg=self.cfg, logger = self.logger)
-            elif self.cfg.DATASET_VERSION.lower() == 'v2':
-                train_dataset = WLASLSMPLXDatasetV2(mode='train', cfg=self.cfg, logger = self.logger)
-                test_dataset = WLASLSMPLXDatasetV2(mode='test', cfg=self.cfg, logger = self.logger, gloss_names=train_dataset.gloss_name_list)
+                train_dataset = How2SignSMPLXDataset(mode='train', cfg=self.cfg, logger=self.logger)
+                test_dataset = How2SignSMPLXDataset(mode='test', cfg=self.cfg, logger=self.logger)
+                
         else:
             raise ValueError(f"Unknown dataset: {self.cfg.DATASET_NAME}")
-            
+
         if self.cfg.TRAIN_BSZ > len(train_dataset):
-            self.cfg.TRAIN_BSZ = len(train_dataset)//2
+            self.cfg.TRAIN_BSZ = len(train_dataset) // 2
+
         self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.cfg.TRAIN_BSZ,
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=self.cfg.NUM_WORKERS,
-            pin_memory=True,
-            drop_last=True
+            train_dataset, batch_size=self.cfg.TRAIN_BSZ, shuffle=True,
+            collate_fn=collate_fn, num_workers=self.cfg.NUM_WORKERS,
+            pin_memory=True, drop_last=True,
         )
-        self.logger.info(f"Train samples: {len(train_dataset)}, Train batches: {len(self.train_loader)}")
-        
+        self.logger.info(f"Train: {len(train_dataset)} samples, {len(self.train_loader)} batches")
 
         if test_dataset is not None:
             self.test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.cfg.EVAL_BSZ,
-                shuffle=False,
-                collate_fn=collate_fn,
-                num_workers=self.cfg.NUM_WORKERS,
-                pin_memory=True
+                test_dataset, batch_size=self.cfg.EVAL_BSZ, shuffle=False,
+                collate_fn=collate_fn, num_workers=self.cfg.NUM_WORKERS, pin_memory=True,
             )
-            self.logger.info(f"Test samples: {len(test_dataset)}, Test batches: {len(self.test_loader)}")
+            self.logger.info(f"Test: {len(test_dataset)} samples")
         else:
             self.test_loader = None
-        
+
+        # Store dataset info in config
         self.cfg.INPUT_DIM = train_dataset.input_dim
-        self.cfg.GLOSS_NAME_LIST = train_dataset.gloss_name_list
-        self.cfg.NUM_CLASSES = len(self.cfg.GLOSS_NAME_LIST)
-        
-        # Model
-        self.logger.info("Building model...")
-        if not self.cfg.USE_LABEL_INDEX_COND:
-            if self.cfg.MODEL_VERSION.lower() == 'v1':
-                self.model = ASLAvatarModel(self.cfg)
-            elif self.cfg.MODEL_VERSION.lower() == 'v2':
-                self.model = ASLAvatarModelV2(self.cfg)
-            else:
-                raise ValueError('incorrect model version!')
-        else:
-            self.model = ASLAvatarModelV3(self.cfg)
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(f"Total parameters: {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable_params:,}")
-        
-        # Optimizer (only trainable params, excluding frozen CLIP)
-        trainable_params_list = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
-            trainable_params_list,
-            lr=self.cfg.LEARNING_RATE,
-            weight_decay=self.cfg.WEIGHT_DECAY
-        )
-        
-        # Learning rate scheduler
-        num_training_steps = self.cfg.MAX_EPOCHS * len(self.train_loader)
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=num_training_steps,
-            eta_min=self.cfg.LEARNING_RATE * 0.01
-        )
-        
-        # Prepare with Accelerator
-        (
-            self.model,
-            self.optimizer,
-            self.train_loader,
-            self.lr_scheduler
-        ) = self.accelerator.prepare(
-            self.model,
-            self.optimizer,
-            self.train_loader,
-            self.lr_scheduler
-        )
-        
-        if self.test_loader is not None:
-            self.test_loader = self.accelerator.prepare(self.test_loader)
 
     
 
+        # Model
+        self.logger.info(f"Building MotionDiffusionModel: {self.cfg.MODEL_VERSION}..")
+        if self.cfg.MODEL_VERSION == 'v1':
+            self.model = MotionDiffusionModelV1(self.cfg)
+        elif self.cfg.MODEL_VERSION == 'v2':
+            self.model = MotionDiffusionModelV2(self.cfg)
+            
+            
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Total params: {total_params:,}")
+        self.logger.info(f"Trainable params: {trainable_params:,}")
+
+        # Optimizer
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            trainable, lr=self.cfg.LEARNING_RATE, weight_decay=self.cfg.WEIGHT_DECAY,
+        )
+
+        # LR scheduler
+        num_training_steps = self.cfg.MAX_EPOCHS * len(self.train_loader)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_training_steps, eta_min=self.cfg.LEARNING_RATE * 0.01,
+        )
+
+        # Accelerate prepare
+        (self.model, self.optimizer, self.train_loader, self.lr_scheduler) = \
+            self.accelerator.prepare(self.model, self.optimizer, self.train_loader, self.lr_scheduler)
+
+        if self.test_loader is not None:
+            self.test_loader = self.accelerator.prepare(self.test_loader)
+
+    # ================================================================== loss
+    def compute_loss(self, x_0_pred, x_0, padding_mask):
+        """
+        Diffusion loss: MSE(x_0_pred, x_0) + velocity loss.
+        No KL term — diffusion doesn't need it.
+        """
+        valid_mask = ~padding_mask  # (B, T)
+        n_feats = 6 if self.cfg.USE_ROT6D else 3
+
+
+        def masked_mse(pred, gt):
+            mse = F.mse_loss(pred, gt, reduction='none')
+            mask = valid_mask.unsqueeze(-1).expand_as(mse).float()
+            return (mse * mask).sum() / (mask.sum() + 1e-8)
+
+        joint_groups = get_joint_slices(n_feats=n_feats)
+
+        ROOT = joint_groups['ROOT']
+        LOWER_BODY = joint_groups['LOWER_BODY']
+        TORSO      = joint_groups['TORSO']
+        ARMS       = joint_groups['ARMS']
+        LHAND      = joint_groups['LHAND']
+        RHAND      = joint_groups['RHAND']
+        JAW        = joint_groups['JAW']
+        
+        
+        # Weighted reconstruction
+        mse_loss = (0.5 * masked_mse(x_0_pred[..., TORSO],  x_0[..., TORSO])
+                  + 0.0 * masked_mse(x_0_pred[..., ROOT],  x_0[..., ROOT])
+                  + 0.0 * masked_mse(x_0_pred[..., LOWER_BODY],  x_0[..., LOWER_BODY])
+                  + 5.0 * masked_mse(x_0_pred[..., ARMS], x_0[..., ARMS])
+                  + 5.0 * masked_mse(x_0_pred[..., LHAND], x_0[..., LHAND])
+                  + 5.0 * masked_mse(x_0_pred[..., RHAND], x_0[..., RHAND])
+                  + 0.1 * masked_mse(x_0_pred[..., JAW],   x_0[..., JAW]))
+
+        # Weighted velocity
+        vel_gt   = x_0[:, 1:] - x_0[:, :-1]
+        vel_pred = x_0_pred[:, 1:] - x_0_pred[:, :-1]
+        vel_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
+
+        def masked_vel(pred, gt):
+            mse = F.mse_loss(pred, gt, reduction='none')
+            mask = vel_valid.unsqueeze(-1).expand_as(mse).float()
+            return (mse * mask).sum() / (mask.sum() + 1e-8)
+
+        vel_loss = (0.5 * masked_vel(vel_pred[..., TORSO],  vel_gt[..., TORSO])
+                  + 0.0 * masked_vel(vel_pred[..., ROOT],  vel_gt[..., ROOT])
+                  + 0.0 * masked_vel(vel_pred[..., LOWER_BODY],  vel_gt[..., LOWER_BODY])
+                  + 5.0 * masked_vel(vel_pred[..., ARMS],  vel_gt[..., ARMS])
+                  + 5.0 * masked_vel(vel_pred[..., LHAND], vel_gt[..., LHAND])
+                  + 5.0 * masked_vel(vel_pred[..., RHAND], vel_gt[..., RHAND])
+                  + 0.1 * masked_vel(vel_pred[..., JAW],   vel_gt[..., JAW]))
+
+
+
+        total = mse_loss + self.cfg.VEL_WEIGHT * vel_loss
+        return total, mse_loss, vel_loss
+
+    # ================================================================== train epoch
+    def train_epoch(self, epoch):
+        self.model.train()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+
+        epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_vel = 0.0
+        num_batches = 0
+
+        num_prints = 50
+        total_steps = len(self.train_loader)
+        print_every = max(total_steps // num_prints, 1)
+        progress_bar = tqdm(total=num_prints,
+                            disable=not self.accelerator.is_local_main_process,
+                            desc=f"Epoch {epoch}")
+
+        for step, batch in enumerate(self.train_loader):
+            if step % print_every == 0 and progress_bar.n < num_prints:
+                progress_bar.update(1)
+
+            with self.accelerator.accumulate(self.model):
+                motion, sentence, _, actual_lengths = batch
+
+                B, T, _ = motion.shape
+                lengths      = actual_lengths.to(motion.device)                
+                padding_mask = create_padding_mask(lengths, T, self.device)
+
+                # ---- Diffusion training step ----
+                # Sample random timestep per sample
+                t = torch.randint(0, unwrapped.num_timesteps, (B,), device=motion.device)
+
+                # Add noise
+                noise = torch.randn_like(motion)
+                x_t = unwrapped.q_sample(motion, t, noise)
+
+                # Predict x_0
+                x_0_pred = self.model(x_t, t, list(sentence), padding_mask, motion)
+
+                # Loss
+                loss, mse, vel = self.compute_loss(x_0_pred, motion, padding_mask)
+
+                # Backward
+                self.accelerator.backward(loss)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+
+                epoch_loss += loss.item()
+                epoch_mse += mse.item()
+                epoch_vel += vel.item()
+                num_batches += 1
+                self.global_step += 1
+
+                if step == 0:
+                    mem = torch.cuda.max_memory_allocated(self.device) / 2**30
+                    self.logger.info(f"[epoch {epoch}] Peak GPU: {mem:.2f} GB")
+
+                if self.debug and step >= 10:
+                    break
+
+        progress_bar.close()
+        return {
+            'loss': epoch_loss / max(num_batches, 1),
+            'mse': epoch_mse / max(num_batches, 1),
+            'vel': epoch_vel / max(num_batches, 1),
+        }
+
+    # ================================================================== eval
+    @torch.no_grad()
+    def evaluate(self, epoch):
+        self.model.eval()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+
+        total_loss = 0.0
+        total_mse = 0.0
+        total_vel = 0.0
+        num_batches = 0
+
+        for batch in tqdm(self.test_loader, desc="Evaluating",
+                          disable=not self.accelerator.is_local_main_process):
+            motion, sentence, _, actual_lengths = batch
+
+            B, T, _ = motion.shape
+            
+            lengths      = actual_lengths.to(motion.device)            
+            padding_mask = create_padding_mask(lengths, T, self.device)
+
+            # Evaluate at a fixed medium noise level (t=500)
+            t = torch.full((B,), 500, dtype=torch.long, device=motion.device)
+            noise = torch.randn_like(motion)
+            x_t = unwrapped.q_sample(motion, t, noise)
+            
+            x_0_pred = self.model(x_t, t, list(sentence), padding_mask, motion)
+
+            loss, mse, vel = self.compute_loss(x_0_pred, motion, padding_mask)
+            total_loss += loss.item()
+            total_mse += mse.item()
+            total_vel += vel.item()
+            num_batches += 1
+
+        metrics = {
+            'loss': total_loss / max(num_batches, 1),
+            'mse': total_mse / max(num_batches, 1),
+            'vel': total_vel / max(num_batches, 1),
+        }
+
+        if self.accelerator.is_main_process:
+            self.logger.info(
+                f"Eval Epoch {epoch+1}: loss={metrics['loss']:.4f}, "
+                f"mse={metrics['mse']:.4f}, vel={metrics['vel']:.4f}"
+            )
+        return metrics
+
+    # ================================================================== main loop
+    def train(self):
+        self.logger.info("=" * 60)
+        self.logger.info("Starting Diffusion Training")
+        self.logger.info(f"  Epochs: {self.cfg.MAX_EPOCHS}")
+        self.logger.info(f"  Batch size: {self.cfg.TRAIN_BSZ}")
+        self.logger.info(f"  Learning rate: {self.cfg.LEARNING_RATE}")
+        self.logger.info(f"  Diffusion steps: {self.cfg.NUM_DIFFUSION_STEPS}")
+        self.logger.info(f"  Vel weight: {self.cfg.VEL_WEIGHT}")
+        self.logger.info("=" * 60)
+
+        train_hist = {'total': [], 'mse': [], 'vel': []}
+        eval_hist = {'total': [], 'mse': [], 'vel': []}
+
+        for epoch in range(self.start_epoch, self.cfg.MAX_EPOCHS):
+            train_metrics = self.train_epoch(epoch)
+
+            train_hist['total'].append(train_metrics['loss'])
+            train_hist['mse'].append(train_metrics['mse'])
+            train_hist['vel'].append(train_metrics['vel'])
+
+            if self.accelerator.is_main_process:
+                self.logger.info(
+                    f"Train Epoch {epoch+1}/{self.cfg.MAX_EPOCHS}: "
+                    f"loss={train_metrics['loss']:.4f}, "
+                    f"mse={train_metrics['mse']:.4f}, vel={train_metrics['vel']:.4f}"
+                )
+
+            if self.test_loader is not None:
+                eval_metrics = self.evaluate(epoch)
+                eval_hist['total'].append(eval_metrics['loss'])
+                eval_hist['mse'].append(eval_metrics['mse'])
+                eval_hist['vel'].append(eval_metrics['vel'])
+            else:
+                eval_metrics = train_metrics
+                eval_hist = None
+
+            is_best = eval_metrics['loss'] < self.best_loss
+            if is_best:
+                self.best_loss = eval_metrics['loss']
+            self.save_checkpoint(epoch, eval_metrics, is_best)
+
+            # Plot curves
+            if self.accelerator.is_main_process and train_hist['total']:
+                fig = os.path.join(self.logging_dir, 'training_curves.png')
+                if os.path.exists(fig):
+                    os.remove(fig)
+                # Adapt hist format for existing plot function
+
+                try:
+                    plot_training_curves(fig, self.start_epoch, train_hist, eval_hist)
+                except Exception:
+                    pass  # Non-critical
+
+            if self.debug and epoch >= 5:
+                break
+
+        self.logger.info("Training complete!")
+        self.accelerator.end_training()
+
+    # ================================================================== checkpoint
     def save_checkpoint(self, epoch, metrics=None, is_best=False):
-        """Save model checkpoint"""
         if not self.accelerator.is_main_process:
             return
-        
-        # Unwrap model
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        
-        # Save only trainable parameters (exclude frozen CLIP)
+
+        unwrapped = self.accelerator.unwrap_model(self.model)
         state_dict = {
-            k: v for k, v in unwrapped_model.state_dict().items()
+            k: v for k, v in unwrapped.state_dict().items()
             if "text_encoder" not in k and "tokenizer" not in k
         }
-        
+
         checkpoint = {
             'epoch': epoch,
             'global_step': self.global_step,
@@ -304,390 +466,82 @@ class Trainer:
             'scheduler_state_dict': self.lr_scheduler.state_dict(),
             'config': vars(self.cfg),
             'metrics': metrics,
-            'best_loss': self.best_loss
-            
+            'best_loss': self.best_loss,
         }
-        
-        # Save regular checkpoint
-        ckpt_path = os.path.join(self.ckpt_dir, f"newest_model.pt")
+
+        ckpt_path = os.path.join(self.ckpt_dir, "newest_model.pt")
         torch.save(checkpoint, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
-        
-        # Save best model
+
         if is_best:
             best_path = os.path.join(self.ckpt_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model: {best_path}")
 
     def load_checkpoint(self, checkpoint_path, finetune=False):
-        """
-        Load checkpoint to resume training or finetune.
-        
-        Args:
-            checkpoint_path: Path to checkpoint file
-            finetune: If True, reset training state (epoch, optimizer, etc.)
-        """
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
+
         self.logger.info(f"Loading checkpoint: {checkpoint_path}")
-        
-        # Load checkpoint to CPU first to save GPU memory
         ckpt = torch.load(checkpoint_path, map_location='cpu')
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        
-        # Load model state (partial, excluding CLIP)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+
         model_state = ckpt['model_state_dict']
-        current_state = unwrapped_model.state_dict()
-        
-        # Update with saved weights (only matching keys)
-        loaded_keys = []
-        skipped_keys = []
+        current_state = unwrapped.state_dict()
+        loaded = 0
         for key in model_state:
-            if key in current_state:
-                if current_state[key].shape == model_state[key].shape:
-                    current_state[key] = model_state[key]
-                    loaded_keys.append(key)
-                else:
-                    skipped_keys.append(key)
-                    self.logger.warning(f"Shape mismatch for {key}: "
-                                       f"{current_state[key].shape} vs {model_state[key].shape}")
-        
-        unwrapped_model.load_state_dict(current_state, strict=False)
-        self.logger.info(f"Loaded model weights (loaded={len(loaded_keys)}, skipped={len(skipped_keys)})")
-        
+            if key in current_state and current_state[key].shape == model_state[key].shape:
+                current_state[key] = model_state[key]
+                loaded += 1
+        unwrapped.load_state_dict(current_state, strict=False)
+        self.logger.info(f"Loaded {loaded} keys")
+
         if finetune:
-            # Finetune mode: reset training state, only keep model weights
             self.logger.info("Finetune mode: resetting training state")
-            self.global_step = 0
-            self.start_epoch = 0
-            self.best_loss = float('inf')
         else:
-            # Resume mode: restore full training state
             if 'optimizer_state_dict' in ckpt:
                 try:
                     self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                    self.logger.info("Loaded optimizer state")
                 except Exception as e:
-                    self.logger.warning(f"Could not load optimizer state: {e}")
-            
+                    self.logger.warning(f"Could not load optimizer: {e}")
             if 'scheduler_state_dict' in ckpt:
                 try:
                     self.lr_scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-                    self.logger.info("Loaded scheduler state")
                 except Exception as e:
-                    self.logger.warning(f"Could not load scheduler state: {e}")
-            
+                    self.logger.warning(f"Could not load scheduler: {e}")
             self.start_epoch = ckpt.get('epoch', -1) + 1
             self.global_step = ckpt.get('global_step', 0)
             self.best_loss = ckpt.get('best_loss', float('inf'))
-            self.logger.info(f"Resumed from epoch {self.start_epoch}, "
-                           f"global_step {self.global_step}, best_loss {self.best_loss:.4f}")
-        
-        # Free memory
+            self.logger.info(f"Resumed from epoch {self.start_epoch}")
+
         del ckpt
         torch.cuda.empty_cache()
-            
-    def get_mask_ratio(self, epoch):
-        mask_increment = self.cfg.MASK_INCREMENT
-        mask_step_epochs = self.cfg.MASK_STEP_EPOCHS
-        max_mask_ratio = self.cfg.MAX_MASK_RATIO
-        return min(mask_increment * (epoch // mask_step_epochs), max_mask_ratio)
 
 
-    def apply_masking(self, motion, ratio, padding_mask=None):
-        """
-        Apply random frame masking for curriculum learning.
-        
-        Args:
-            motion: (B, T, D) - pose sequences
-            ratio: float - fraction of frames to mask
-            padding_mask: (B, T) - True where padded (don't mask padding)
-        
-        Returns:
-            masked_motion: (B, T, D)
-        """
-        if ratio <= 0:
-            return motion
-        
-        B, T, D = motion.shape
-        device = motion.device
-        
-        # Random mask: True = keep, False = mask
-        keep_mask = torch.rand(B, T, device=device) >= ratio
-        
-        # Don't mask already padded positions
-        if padding_mask is not None:
-            keep_mask = keep_mask | padding_mask  # Keep if padding or randomly kept
-        
-        # Apply mask
-        masked_motion = motion * keep_mask.unsqueeze(-1).float()
-        
-        return masked_motion
-
-    def compute_loss(self, recon, target, mu, logvar, padding_mask):
-        """
-        Compute CVAE loss = reconstruction + KL divergence.
-        
-        Args:
-            recon: (B, T, D) - reconstructed motion
-            target: (B, T, D) - ground truth motion
-            mu: (B, latent_dim) - mean
-            logvar: (B, latent_dim) - log variance
-            padding_mask: (B, T) - True where padded
-        
-        Returns:
-            total_loss, mse_loss, kl_loss
-        """
-        # Reconstruction loss (MSE, excluding padding)
-        mse = F.mse_loss(recon, target, reduction='none')  # (B, T, D)
-        
-        # Create mask for valid (non-padded) positions
-        valid_mask = ~padding_mask  # (B, T), True where valid
-        valid_mask_expanded = valid_mask.unsqueeze(-1).expand_as(mse)  # (B, T, D)
-        
-        # Masked MSE
-        mse_masked = mse * valid_mask_expanded.float()
-        num_valid = valid_mask_expanded.sum()
-        mse_loss = mse_masked.sum() / (num_valid + 1e-8)
-        
-        # KL divergence: KL(N(mu, sigma) || N(0, I))
-        # = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_loss = kl_loss / mu.size(0)  # Normalize by batch size
-        
-        # Total loss
-        total_loss = mse_loss + self.cfg.KL_WEIGHT * kl_loss
-        
-        return total_loss, mse_loss, kl_loss
-
-    def train_epoch(self, epoch):
-        """Run one training epoch"""
-        self.model.train()
-        
-        mask_ratio = self.get_mask_ratio(epoch)
-        epoch_loss = 0.0
-        epoch_mse = 0.0
-        epoch_kl = 0.0
-        num_batches = 0
-        
-        num_prints = 50
-        total_steps = len(self.train_loader)
-        print_every = max(total_steps // num_prints, 1)
-
-        progress_bar = tqdm(
-            total=num_prints,
-            disable=not self.accelerator.is_local_main_process,
-            desc=f"Epoch {epoch}"
-        )
-        
-        for step, batch in enumerate(self.train_loader):
-            if step % print_every == 0 and progress_bar.n < num_prints:
-                progress_bar.update(1)
-            with self.accelerator.accumulate(self.model):
-                motion, gloss, lengths = batch
-                B, T, _ = motion.shape
-                
-                if self.cfg.USE_LABEL_INDEX_COND:
-                    gloss_index = torch.tensor([self.cfg.GLOSS_NAME_LIST.index(gl) for gl in gloss], dtype=torch.long).to(motion.device)
-                    gloss = gloss_index
-                # Create padding mask
-                padding_mask = create_padding_mask(lengths, T, self.device)
-                
-                # Apply curriculum masking to encoder input
-                input_motion = self.apply_masking(motion, mask_ratio, padding_mask)
-                
-                # Forward pass
-                recon_motion, mu, logvar = self.model(input_motion, gloss, padding_mask)
-                
-                # Compute loss (compare with original unmasked motion)
-                loss, mse, kl = self.compute_loss(recon_motion, motion, mu, logvar, padding_mask)
-                
-                # Backward
-                self.accelerator.backward(loss)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # 
-
-                # Gradient clipping
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                
-                # Logging
-                epoch_loss += loss.item()
-                epoch_mse += mse.item()
-                epoch_kl += kl.item()
-                num_batches += 1
-                
-                    
-                if step == 0:
-                    mem = torch.cuda.max_memory_allocated(self.device) / 2**30
-                    self.logger.info(f"[epoch {epoch}] Peak GPU: {mem:.2f} GB")
-
-                if self.debug and step >= 10:
-                    break
-                
-        progress_bar.close()
-        # Return epoch averages
-        return {
-            'loss': epoch_loss / num_batches,
-            'mse': epoch_mse / num_batches,
-            'kl': epoch_kl / num_batches,
-            'mask_ratio': mask_ratio
-        }
-
-
-
-    def train(self):
-        """Main training loop"""
-        self.logger.info("=" * 60)
-        self.logger.info("Starting training")
-        self.logger.info(f"  Epochs: {self.cfg.MAX_EPOCHS}")
-        self.logger.info(f"  Batch size: {self.cfg.TRAIN_BSZ}")
-        self.logger.info(f"  Learning rate: {self.cfg.LEARNING_RATE}")
-        self.logger.info(f"  KL weight: {self.cfg.KL_WEIGHT}")
-        self.logger.info(f"  Curriculum learning: {self.cfg.USE_CURRICULUM}")
-        self.logger.info("=" * 60)
-        
-
-        train_hist = {'total': [],
-                'rec': [],
-                'kl': [],
-                'mask_ratio': []}      
-
-        eval_hist = {
-            'total': [],
-            'rec': [],
-            'kl': []
-        }
-        
-        for epoch in range(self.start_epoch, self.cfg.MAX_EPOCHS):
-            # Train
-            train_metrics = self.train_epoch(epoch)
-            
-            train_hist['total'].append(train_metrics['loss'])
-            train_hist['rec'].append(train_metrics['mse'])
-            train_hist['kl'].append(train_metrics['kl'])
-            train_hist['mask_ratio'].append(train_metrics['mask_ratio'])
-            
-            if self.accelerator.is_main_process:
-                self.logger.info(
-                    f"Train Epoch {epoch+1}/{self.cfg.MAX_EPOCHS}: loss={train_metrics['loss']:.4f}, "
-                    f"rec={train_metrics['mse']:.4f}, kl={train_metrics['kl']:.4f}, mask_ratio={train_metrics['mask_ratio']:.2f}"
-                )
-            
-
-            if not self.test_loader is None:
-                # Evaluate
-                eval_metrics = self.evaluate(epoch)
-                
-                eval_hist['total'].append(eval_metrics['loss'])
-                eval_hist['rec'].append(eval_metrics['mse'])
-                eval_hist['kl'].append(eval_metrics['kl'])
-            else:
-                eval_metrics = train_metrics
-                eval_hist = None
-                
-            # Check if best
-            is_best = eval_metrics['loss'] < self.best_loss
-            if is_best:
-                self.best_loss = eval_metrics['loss']
-
-            self.save_checkpoint(epoch, eval_metrics, is_best)
-
-        
-        
-            if self.accelerator.is_main_process and train_hist['total']:
-                fig = os.path.join(self.logging_dir, 'training_curves.png')
-                if os.path.exists(fig):
-                    os.remove(fig)
-                plot_training_curves(fig, self.start_epoch,
-                                    train_hist, eval_hist)
-                self.logger.info(f"Saved curves: {fig}")
-            
-            if self.debug and epoch >= 5:
-                break
-        self.logger.info("Training complete!")
-
-        
-        self.accelerator.end_training()
-        self.logger.info("Training completed!")
-
-
-    
-    @torch.no_grad()
-    def evaluate(self, epoch):
-        """Run evaluation on test set"""
-        self.model.eval()
-        
-        total_loss = 0.0
-        total_mse = 0.0
-        total_kl = 0.0
-        num_batches = 0
-        
-        for batch in tqdm(self.test_loader, desc="Evaluating", 
-                          disable=not self.accelerator.is_local_main_process):
-            motion, gloss, lengths = batch
-            B, T, _ = motion.shape
-    
-            if self.cfg.USE_LABEL_INDEX_COND:
-                gloss_index = torch.tensor([self.cfg.GLOSS_NAME_LIST.index(gl) for gl in gloss], dtype=torch.long).to(motion.device)
-                gloss = gloss_index
-            padding_mask = create_padding_mask(lengths, T, self.device)
-            
-            # No masking during evaluation
-            recon_motion, mu, logvar = self.model(motion, gloss, padding_mask)
-            loss, mse, kl = self.compute_loss(recon_motion, motion, mu, logvar, padding_mask)
-            
-            total_loss += loss.item()
-            total_mse += mse.item()
-            total_kl += kl.item()
-            num_batches += 1
-        
-        metrics = {
-            'loss': total_loss / num_batches,
-            'mse': total_mse / num_batches,
-            'kl': total_kl / num_batches
-        }
-        
-        if self.accelerator.is_main_process:
-            self.accelerator.log({
-                "eval/loss": metrics['loss'],
-                "eval/mse": metrics['mse'],
-                "eval/kl": metrics['kl']
-            }, step=self.global_step)
-            
-            self.logger.info(
-                f"Eval Epoch {epoch+1}: loss={metrics['loss']:.4f}, "
-                f"mse={metrics['mse']:.4f}, kl={metrics['kl']:.4f}"
-            )
-        
-        return metrics
-
-
+# ================================================================== CLI
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ASL Avatar Model")
-    parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
-    parser.add_argument("--finetune", action="store_true", help="Finetune mode: load weights but reset training state")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    parser.add_argument("--dataset", type=str, default="SignBank_SMPLX", choices=["ASLLVD_Skeleton3D", "SignBank_SMPLX", "WLASL_SMPLX"], help="Dataset to use")
-    parser.add_argument("--use_upper_body", action="store_true", help="only use upper body")
-    parser.add_argument("--use_rot6d", action="store_true", help="use 6d rotation")
-    parser.add_argument("--use_mini_dataset", action="store_true", help="use mini dataset")
-    parser.add_argument("--use_lebel_index_cond", action="store_true", help = "use label index condition")
+    parser = argparse.ArgumentParser(description="Train ASL Avatar Diffusion Model")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--finetune", action="store_true", default=False)
+    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--dataset", type=str, default="How2SignSMPLX",
+                        choices=["How2SignSMPLX"])
+    parser.add_argument("--use_upper_body", action="store_true", default=False)
+    parser.add_argument("--use_rot6d", action="store_true", default=False)
+    parser.add_argument("--use_mini_dataset", action="store_true", default=False)
+    parser.add_argument("--no_root_normalize", action="store_true", default=False)
+    parser.add_argument("--use_phono_attribute", action="store_true", default=False)
+    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5"])
+    parser.add_argument("--model_version", type=str, default='v1', choices=["v1", "v2"])
     
-
     return parser.parse_args()
-
-
 
 
 if __name__ == "__main__":
     args = parse_args()
-    trainer = Trainer(args)
+    trainer = DiffusionTrainer(args)
     trainer.train()
+    

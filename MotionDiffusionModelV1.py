@@ -78,7 +78,7 @@ class PositionalEncoding(nn.Module):
 # Model
 # =============================================================================
 
-class MotionDiffusionModel(nn.Module):
+class MotionDiffusionModelV1(nn.Module):
     """
     MDM-style Motion Diffusion Model with switchable text encoder.
     

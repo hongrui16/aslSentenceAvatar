@@ -29,7 +29,8 @@ import torch
 from datetime import datetime
 from tqdm import tqdm
 
-from aslAvatarModel_v5 import MotionDiffusionModel
+from MotionDiffusionModelV1 import MotionDiffusionModelV1
+from MotionDiffusionModelV2 import MotionDiffusionModelV2
 from config import How2Sign_SMPLX_Config
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
 from utils.rotation_conversion import postprocess_motion
@@ -43,6 +44,92 @@ from generate_smplx_param import (
     save_gif,
     PARAM_SLICES,
 )
+
+# =============================================================================
+# Macro — set to True to compute FID / DTW / MPJPE after generation
+# =============================================================================
+
+
+# =============================================================================
+# Metric utilities
+# =============================================================================
+
+from scipy import linalg
+
+
+def _pool_sequence(seq_np):
+    """
+    Mean pool (T, D) → (D,) feature vector for FID.
+    seq_np: numpy array (T, D)
+    """
+    return seq_np.mean(axis=0)
+
+
+def compute_fid(feats_real, feats_gen):
+    """
+    Fréchet Inception Distance between two sets of feature vectors.
+    feats_real, feats_gen: list of (D,) numpy arrays
+    Returns: float
+    """
+    r = np.stack(feats_real, axis=0).astype(np.float64)  # (N, D)
+    g = np.stack(feats_gen,  axis=0).astype(np.float64)
+
+    mu_r, mu_g = r.mean(axis=0), g.mean(axis=0)
+    # Add small diagonal for numerical stability
+    eps = 1e-6
+    sigma_r = np.cov(r, rowvar=False) + np.eye(r.shape[1]) * eps
+    sigma_g = np.cov(g, rowvar=False) + np.eye(g.shape[1]) * eps
+
+    diff = mu_r - mu_g
+    covmean, _ = linalg.sqrtm(sigma_r @ sigma_g, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid = float(diff @ diff + np.trace(sigma_r + sigma_g - 2.0 * covmean))
+    return fid
+
+
+def compute_dtw(seq_a, seq_b):
+    """
+    DTW distance between two sequences, normalised by path length.
+    seq_a: (T_a, D), seq_b: (T_b, D) numpy arrays
+    Returns: float
+    """
+    T_a, T_b = len(seq_a), len(seq_b)
+    dtw = np.full((T_a + 1, T_b + 1), np.inf)
+    dtw[0, 0] = 0.0
+    for i in range(1, T_a + 1):
+        for j in range(1, T_b + 1):
+            cost = np.linalg.norm(seq_a[i-1] - seq_b[j-1])
+            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+    return float(dtw[T_a, T_b] / (T_a + T_b))
+
+
+def compute_mpjpe(pred_np, gt_np):
+    """
+    Mean per-frame L2 distance between two sequences of equal length.
+    pred_np, gt_np: (T, D) numpy arrays
+    Returns: float
+    """
+    return float(np.linalg.norm(pred_np - gt_np, axis=-1).mean())
+
+
+def gt_params_to_flat(gt_params_list):
+    """
+    Convert list of per-frame param dicts → (T, 159) numpy array.
+    Order: root(3) + body(63) + lhand(45) + rhand(45) + jaw(3) = 159
+    """
+    frames = []
+    for p in gt_params_list:
+        flat = np.concatenate([
+            p['smplx_root_pose'],
+            p['smplx_body_pose'],
+            p['smplx_lhand_pose'],
+            p['smplx_rhand_pose'],
+            p['smplx_jaw_pose'],
+        ])
+        frames.append(flat)
+    return np.stack(frames, axis=0).astype(np.float32)  # (T, 159)
 
 # =============================================================================
 # Helpers
@@ -292,7 +379,7 @@ def process_one_sample(
     render_to_gif(gen_params, smpl_x,
                   os.path.join(save_dir, 'generated.gif'),
                   img_size=img_size, gif_fps=gif_fps,
-                  flip_coords=False)   # postprocessed → no flip needed
+                  flip_coords=False)
 
     # ── 2. GT GIF ─────────────────────────────────────────────────────────────
     print(f"     Rendering GT...")
@@ -302,7 +389,12 @@ def process_one_sample(
     render_to_gif(gt_params, smpl_x,
                   os.path.join(save_dir, 'gt.gif'),
                   img_size=img_size, gif_fps=gif_fps,
-                  flip_coords=False)  # zero_root=True → SMPL-X canonical, no flip needed
+                  flip_coords=False)
+
+    # ── 3. Return flat sequences for metric computation ───────────────────────
+    gt_flat = gt_params_to_flat(gt_params)   # (T, 159)
+    # motion is already (T, 159) from generate_motion
+    return motion, gt_flat  # both (T, 159) numpy
 
 
 # =============================================================================
@@ -333,6 +425,8 @@ def main(args):
     cfg.ROOT_NORMALIZE  = not args.no_root_normalize
     cfg.N_FEATS         = 6 if cfg.USE_ROT6D else 3
     cfg.TARGET_SEQ_LEN  = args.target_seq_len
+    cfg.MODEL_VERSION = args.model_version
+    COMPUTE_METRICS = args.compute_metrics
     
     if not args.poses_root is None:
         cfg.ROOT_DIR        = args.poses_root 
@@ -362,7 +456,12 @@ def main(args):
     cfg.INPUT_DIM = test_dataset.input_dim
 
     # ── model ─────────────────────────────────────────────────────────────────
-    model = MotionDiffusionModel(cfg)
+    print(f"Building MotionDiffusionModel: {cfg.MODEL_VERSION}..")
+    if cfg.MODEL_VERSION == 'v1':
+        model = MotionDiffusionModelV1(cfg)
+    elif cfg.MODEL_VERSION == 'v2':
+        model = MotionDiffusionModelV2(cfg)
+
     model = load_model_weight(model, args.checkpoint, device)
 
     # ── SMPL-X renderer ───────────────────────────────────────────────────────
@@ -374,9 +473,14 @@ def main(args):
     print(f"\nSelected {n_samples} samples from {len(test_dataset)} test clips")
 
     # ── generate + render ─────────────────────────────────────────────────────
+    feats_gen  = []   # for FID
+    feats_real = []
+    dtw_list   = []
+    mpjpe_list = []
+
     for rank, ds_idx in enumerate(tqdm(sample_indices, desc="Processing")):
         sentence, pkl_paths = test_dataset.data_list[ds_idx]
-        process_one_sample(
+        gen_seq, gt_seq = process_one_sample(
             idx        = rank,
             sentence   = sentence,
             pkl_paths  = pkl_paths,
@@ -389,6 +493,46 @@ def main(args):
             img_size   = args.img_size,
             gif_fps    = args.gif_fps,
         )
+
+        if COMPUTE_METRICS:
+            # FID features: mean pool over time axis
+            feats_gen.append(_pool_sequence(gen_seq))
+            feats_real.append(_pool_sequence(gt_seq))
+
+            # DTW and MPJPE on sequences of equal length (both are seq_len)
+            dtw_list.append(compute_dtw(gen_seq, gt_seq))
+            mpjpe_list.append(compute_mpjpe(gen_seq, gt_seq))
+
+    # ── compute and save metrics ───────────────────────────────────────────────
+    if COMPUTE_METRICS and len(feats_gen) >= 2:
+        import json
+
+        fid   = compute_fid(feats_real, feats_gen)
+        dtw   = float(np.mean(dtw_list))
+        mpjpe = float(np.mean(mpjpe_list))
+
+        metrics = {
+            'num_samples': len(feats_gen),
+            'FID':         round(fid,   4),
+            'DTW':         round(dtw,   4),
+            'MPJPE':       round(mpjpe, 4),
+            'DTW_per_sample':   [round(v, 4) for v in dtw_list],
+            'MPJPE_per_sample': [round(v, 4) for v in mpjpe_list],
+        }
+
+        metrics_path = os.path.join(os.path.dirname(output_dir), 'metrics.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+        print("\n" + "=" * 45)
+        print(f"  FID  : {fid:.4f}   (lower is better)")
+        print(f"  DTW  : {dtw:.4f}   (lower is better)")
+        print(f"  MPJPE: {mpjpe:.4f}  (feature-space proxy)")
+        print("=" * 45)
+        print(f"  Metrics saved → {metrics_path}")
+
+    elif COMPUTE_METRICS:
+        print("WARNING: need >= 2 samples to compute FID, skipping metrics.")
 
     print(f"\nDone! Results in: {output_dir}")
 
@@ -407,6 +551,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_rot6d",         action="store_true")
     parser.add_argument("--use_upper_body",    action="store_true")
     parser.add_argument("--no_root_normalize", action="store_true")
+    parser.add_argument("--compute_metrics", action="store_true")
+    
     parser.add_argument("--seed",              type=int, default=42)
+    parser.add_argument("--model_version", type=str, default='v1', choices=["v1", "v2"])
+
     args = parser.parse_args()
     main(args)

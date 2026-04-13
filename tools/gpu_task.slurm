@@ -25,15 +25,20 @@ source /home/rhong5/py310Torch/bin/activate
 # # source /home/rhong5/env_mmcv/bin/activate
 # # cd /home/rhong5/research_pro/hand_modeling_pro/HandPoseSD
 # # python train_handposeRegressor.py
+cd /scratch/rhong5/dataset/Neural-Sign-Actors
+unzip -q test_poses.zip -d test_poses
+unzip -q val_poses.zip -d val_poses
+unzip -q train_poses.zip -d train_poses
+
 
 cd /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/
 # python InterHand26M.py --split train
 # python InterHand26M.py --split val
 # python InterHand26M.py --split test
 
-python -u /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/detect_pose.py
+# python -u /home/rhong5/research_pro/hand_modeling_pro/aslAvatar/tools/detect_pose_video.py
 
-# sh update_timestamp.sh /scratch/rhong5/dataset/InterHand
+sh update_timestamp.sh /scratch/rhong5/dataset/Neural-Sign-Actors
 
 # torchrun --nnodes=${NUM_NODES} --nproc_per_node=${GPUS_PER_NODE} train_VAE.py --debug 
 
