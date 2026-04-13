@@ -28,8 +28,8 @@ from accelerate.logging import get_logger
 
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
 
-from MotionDiffusionModelV1 import MotionDiffusionModelV1
-from MotionDiffusionModelV2 import MotionDiffusionModelV2
+from network.MotionDiffusionModelV1 import MotionDiffusionModelV1
+from network.MotionDiffusionModelV2 import MotionDiffusionModelV2
 
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
 from config import How2Sign_SMPLX_Config

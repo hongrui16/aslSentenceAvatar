@@ -30,7 +30,7 @@ from sacrebleu.metrics import BLEU
 from rouge_score import rouge_scorer as rouge_lib
 
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
-from BackTranslationModel import BackTranslationModel
+from network.BackTranslationModel import BackTranslationModel
 from utils.utils import plot_training_curves, backup_code, create_padding_mask
 from config import How2Sign_SMPLX_Config
 

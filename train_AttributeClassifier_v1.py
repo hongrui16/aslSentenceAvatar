@@ -24,7 +24,7 @@ from sklearn.model_selection import train_test_split
 from dataloader.SignBankHandshapeDataset import (
     SignBankHandshapeDataset, get_task_info
 )
-from HandshapeClassifier import HandshapeClassifier
+from network.HandshapeClassifier import HandshapeClassifier
 
 
 
