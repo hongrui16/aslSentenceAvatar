@@ -80,6 +80,15 @@ class BaseConfig:
         self.GNN_JOINT_DIM = 128
         self.GNN_N_LAYERS = 4
 
+        # ==================== Voting Module ====================
+        self.GLOSS_SOURCE = 'rule_based'  # 'rule_based' or 'llm_draft'
+        self.VOTING_N_LAYERS = 2
+        self.VOTING_N_HEADS = 4
+        self.VOTING_FF_MULT = 2
+        self.VOTING_MAX_WORDS = 64
+        self.SPARSE_WEIGHT = 0.01
+        self.ENTROPY_WEIGHT = 0.01
+
 
 
 class How2Sign_SMPLX_Config(BaseConfig):

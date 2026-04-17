@@ -2,7 +2,7 @@
 
 #SBATCH --partition=contrib-gpuq                    # need to set 'gpuq' or 'contrib-gpuq' partition
 #SBATCH --qos=gpu                           # need to select 'gpu' QOS or other relevant QOS
-#SBATCH --job-name=aslAvav2                  # Job name
+#SBATCH --job-name=aslAvacf                  # Job name
 #SBATCH --output=/home/rhong5/research_pro/hand_modeling_pro/aslSentenceAvatar/zlog/zslurm/%x-%N-%j.out   # Output file
 #SBATCH --error=/home/rhong5/research_pro/hand_modeling_pro/aslSentenceAvatar/zlog/zslurm/%x-%N-%j.err    # Error file
 #SBATCH --nodes=1
@@ -31,13 +31,36 @@ echo "Random port: $PORT"
 
 
 
+# accelerate launch --num_processes=1 \
+#     --num_machines=1 \
+#     --machine_rank=0 \
+#     --main_process_ip=localhost \
+#     --main_process_port=$PORT \
+#     trainMotionDiffusion.py  --dataset How2SignSMPLX --use_upper_body --use_rot6d --model_version v2
+
+
+
 accelerate launch --num_processes=1 \
     --num_machines=1 \
     --machine_rank=0 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
-    train_v1.py  --dataset How2SignSMPLX --use_upper_body --use_rot6d --model_version v2
+    trainMotionDiffusion_cfg.py  --cond_mode sentence
 
+
+# accelerate launch --num_processes=1 \
+#     --num_machines=1 \
+#     --machine_rank=0 \
+#     --main_process_ip=localhost \
+#     --main_process_port=$PORT \
+#     trainMotionDiffusion_cfg.py  --cond_mode gloss
+
+# accelerate launch --num_processes=1 \
+#     --num_machines=1 \
+#     --machine_rank=0 \
+#     --main_process_ip=localhost \
+#     --main_process_port=$PORT \
+#     trainMotionDiffusion_cfg.py  --cond_mode sentence_gloss
 
 
 

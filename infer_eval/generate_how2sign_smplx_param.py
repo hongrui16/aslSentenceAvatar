@@ -29,8 +29,10 @@ import torch
 from datetime import datetime
 from tqdm import tqdm
 
-from MotionDiffusionModelV1 import MotionDiffusionModelV1
-from MotionDiffusionModelV2 import MotionDiffusionModelV2
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from network.MotionDiffusionModelV1 import MotionDiffusionModelV1
+from network.MotionDiffusionModelV2 import MotionDiffusionModelV2
 from config import How2Sign_SMPLX_Config
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
 from utils.rotation_conversion import postprocess_motion

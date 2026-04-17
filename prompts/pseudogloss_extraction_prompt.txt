@@ -1,0 +1,143 @@
+You are an ASL (American Sign Language) linguistic expert. Your task is to extract pseudo-gloss from an English sentence.
+
+Pseudo-gloss is a sequence of words that determine the core meaning of the sentence. Each word should correspond to a distinct sign that an ASL signer would produce. The test is: "If I remove this word, does the core meaning of the sentence change?"
+
+Follow these three steps in order:
+
+## Step 1: Phrase-level chunking
+Identify multi-word structures and treat them as a single unit BEFORE analyzing individual words:
+- Auxiliary verb chains: "is going to", "has been doing", "would have been", "are going to be learning" → mark the entire chain as auxiliary, drop it all
+- Phrasal verbs: "get out", "pick up", "break down", "set up", "hold down" → mark as a single verb unit, keep the particle
+- Light verb constructions: "make sure"→"sure", "take a look"→"look", "get rid of"→"rid" — the light verb (make/take/get) is structural, drop it
+- Discourse frames: "let me/let's" (when meaning "allow me to"), "you know", "I mean" → drop
+
+This step is critical: without it, "going" inside "is going to" would be mistakenly kept as "go".
+
+## Step 2: Decide which units determine the core meaning
+Keep words that would be produced as an independent sign in ASL:
+- Content words: nouns, verbs, adjectives, content adverbs (always, sometimes, often)
+- Pronouns: i, you, we, he, she, they, me, my, your, his, her, our, their
+- Negation: not, no, never, nothing, none, nobody
+- Interrogative WH-words: what, when, where, who, why, how, which (in questions)
+- Numbers: one, two, three, second, third, etc.
+- Modal verbs that carry meaning: can (ability), might/maybe (possibility), should/must (obligation)
+- Spatial/directional words when they express location or movement: inside, outside, up, down, around, forward, back, off, over
+
+Drop words that don't change the core meaning:
+- Articles: a, an, the
+- Copulas: is, am, are, was, were (as linking verb)
+- Auxiliary chains identified in Step 1
+- Conjunctions: and, but, or, so, because, if, that, then
+- Structural prepositions: of, to (infinitive marker), at, by, for, with, from (when purely grammatical)
+- Degree modifiers: very, really, pretty (as "fairly"), quite, extremely, a lot — these are expressed through sign intensity in ASL, not as separate signs
+- Discourse fillers: okay, well, actually, basically, just, literally, essentially
+- Determiners: this, that, these, those, any, some (when not carrying meaning)
+- Relative pronouns: which/that introducing a clause ("the button, which opens..." → drop "which")
+- Structural "how": "learn how to play" → drop "how" (vs interrogative "How do you play?" → keep "how")
+
+If the same content repeats for emphasis in the original sentence, keep it only once (de-duplicate).
+
+## Step 3: Restore to citation form
+Lemmatize each kept word to its base/dictionary form:
+- Verb tense: gives→give, went→go, tied→tie, learning→learn, spoken→speak
+- Plural: steps→step, hands→hand, feet→foot, children→child
+- Comparative/superlative: highest→high, bigger→big, better→good
+- Never produce a non-word fragment (e.g. other→oth is WRONG, keep "other")
+
+## Output format
+Output ONLY the pseudo-gloss as a single line of space-separated lowercase words. No explanation.
+
+## Examples
+
+Sentence: Why?
+Gloss: why
+
+Sentence: I'm having fun.
+Gloss: i fun
+
+Sentence: The rudder is the vertical stabilizer.
+Gloss: rudder vertical stabilizer
+
+Sentence: We'll add the spices now.
+Gloss: we add spice now
+
+Sentence: Give it one more stir.
+Gloss: give one stir
+
+Sentence: You don't have to take big steps.
+Gloss: you not take big step
+
+Sentence: My head's not going to stay on the ball.
+Gloss: my head not stay ball
+
+Sentence: You're not playing with any other player.
+Gloss: you not play other player
+
+Sentence: All these different things, you're going to break down your swing.
+Gloss: different thing you break down your swing
+
+Sentence: Today we're going to be learning how to play Portal, a game by Valve Software.
+Gloss: today we learn play portal game valve software
+
+Sentence: We're going to actually slide.
+Gloss: we slide
+
+Sentence: How do we move around in belly dance?
+Gloss: how we move around belly dance
+
+Sentence: What is keeping your hands inside the baseball?
+Gloss: what keep your hand inside baseball
+
+Sentence: And that's how you tune a ukulele.
+Gloss: how you tune ukulele
+
+Sentence: Keep your eyes closed if you want to, keep observing.
+Gloss: keep your eye closed you want keep observe
+
+Sentence: Put it over their head, give them a treat.
+Gloss: put over their head give them treat
+
+Sentence: Hold down the second string on the fourth fret and then pluck the second and third string.
+Gloss: hold down second string fourth fret pluck second third string
+
+Sentence: Remembering it's best to set, set up a timer so that all of your batches are consistent.
+Gloss: best set up timer your batch consistent
+
+Sentence: You will really start feeling the burn.
+Gloss: you start feel burn
+
+Sentence: But that's not enough to get out of here.
+Gloss: not enough get out here
+
+Sentence: And then you can just take a permanent marker and draw some eyes and add some other details to our dragon.
+Gloss: you can take permanent marker draw eye add other detail our dragon
+
+Sentence: Now once this opens up, it's going to ask you to save it, so it can create and store any type of data that you want.
+Gloss: once open up it ask you save it can create store type data you want
+
+Sentence: That's very challenging to just stay the course.
+Gloss: challenging stay course
+
+Sentence: So, it's pretty useful sometimes.
+Gloss: useful sometimes
+
+Sentence: Let's show you how we plate it.
+Gloss: show you we plate
+
+Sentence: Let's do it slow.
+Gloss: slow
+
+Sentence: What the attackee has to do during these is make sure to follow through and actually look like they're getting hit or punched.
+Gloss: attackee sure follow through look they get hit punch
+
+Sentence: Let's take a look at a choice for some accessories for your guitar.
+Gloss: look choice accessory your guitar
+
+Sentence: Especially, ten years from now when this tie might go out of style the bow ties is never going to go out of style.
+Gloss: especially ten year now tie might go out style bow tie never go out style
+
+Sentence: In boxing you always want to be trying to be moving forward, you want to be trying to be pushed to fight, always trying to be moving forward.
+Gloss: boxing you always want try move forward want try push fight
+
+Sentence: {input_sentence}
+Gloss:

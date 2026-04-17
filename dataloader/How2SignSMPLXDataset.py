@@ -73,19 +73,22 @@ class How2SignSMPLXDataset(Dataset):
         # Configuration
         self.use_rot6d      = getattr(cfg, 'USE_ROT6D',      False)  if cfg else False
         self.use_upper_body = getattr(cfg, 'USE_UPPER_BODY', False)  if cfg else False
+        self.use_expression = getattr(cfg, 'USE_EXPRESSION', False)  if cfg else False
+        self.n_expr         = getattr(cfg, 'N_EXPR',           10)   if cfg else 10
         self.target_seq_len = getattr(cfg, 'TARGET_SEQ_LEN', 200)   if cfg else 200
-        self.root_dir     = getattr(cfg, 'ROOT_DIR',        '/scratch/rhong5/dataset/Neural-Sign-Actors')   if cfg else '/scratch/rhong5/dataset/Neural-Sign-Actors'
-        self.smplx_dir = os.path.join(self.root_dir, f'{mode}_poses/poses')
+        self.root_dir       = getattr(cfg, 'ROOT_DIR',        '/scratch/rhong5/dataset/Neural-Sign-Actors')   if cfg else '/scratch/rhong5/dataset/Neural-Sign-Actors'
+        self.smplx_dir      = os.path.join(self.root_dir, f'{mode}_poses/poses')
         self.xlsx_path      = os.path.join(self.root_dir, f'how2sign_realigned_{mode}.xlsx')
         self.camera         = getattr(cfg, 'CAMERA',          'rgb_front') if cfg else 'rgb_front'
         self.min_frames     = 10
 
-        # Compute dimensions
-        self.n_joints  = len(ALL_INDICES)
-        self.n_feats   = 6 if self.use_rot6d else 3
-        self.input_dim = self.n_joints * self.n_feats
-
+        # Always emit the sparse 53-joint layout; models (V1/V2/NSA) handle
+        # `use_upper_body` themselves via their own bypass/tosave_slices logic.
+        # Expression (10 blendshape coeffs) is appended at the tail when enabled.
         self.joint_indices = ALL_53_JOINTS
+        self.n_joints      = len(self.joint_indices)
+        self.n_feats       = 6 if self.use_rot6d else 3
+        self.input_dim     = self.n_joints * self.n_feats + (self.n_expr if self.use_expression else 0)
 
         # Data storage
         self.data_list = []   # [(sentence_str, pkl_paths_list), ...]
@@ -114,7 +117,7 @@ class How2SignSMPLXDataset(Dataset):
             stext    = str(row["SENTENCE"]).strip()
             pose_dir = os.path.join(self.smplx_dir, sname)
 
-            if not os.path.isdir(pose_dir):
+            if not os.path.isdir(pose_dir) or not stext:
                 n_missing += 1
                 continue
 
@@ -127,17 +130,11 @@ class How2SignSMPLXDataset(Dataset):
                 n_short += 1
                 continue
 
-            # 只验证第一个 pkl，损坏的整个 sentence 直接跳过
             try:
                 with open(pkls[0], 'rb') as f:
                     pickle.load(f)
             except Exception:
                 n_corrupt += 1
-                continue
-
-            # 空句子也跳过
-            if not stext:
-                n_missing += 1
                 continue
 
             self.data_list.append((stext, pkls))
@@ -161,7 +158,9 @@ class How2SignSMPLXDataset(Dataset):
     @staticmethod
     def _load_pose_from_pkls(pkl_paths):
         """
-        Load per-frame pkl files and assemble into (T, 53, 3) axis-angle array.
+        Load per-frame pkl files and assemble into:
+            pose: (T, 53, 3) axis-angle
+            expr: (T, 10)    expression blendshape coefficients
 
         Neural Sign Actors per-frame pkl layout:
             smplx_root_pose:  (3,)   → joint 0
@@ -169,8 +168,10 @@ class How2SignSMPLXDataset(Dataset):
             smplx_lhand_pose: (45,)  → joints 22-36 (15 joints)
             smplx_rhand_pose: (45,)  → joints 37-51 (15 joints)
             smplx_jaw_pose:   (3,)   → joint 52
+            smplx_expr:       (10,)  → expression blendshape coefficients
         """
-        frames = []
+        pose_frames = []
+        expr_frames = []
         for p in pkl_paths:
             with open(p, 'rb') as f:
                 d = pickle.load(f)
@@ -181,8 +182,18 @@ class How2SignSMPLXDataset(Dataset):
                 np.array(d['smplx_rhand_pose']).reshape(15, 3),
                 np.array(d['smplx_jaw_pose']).reshape(1,  3),
             ], axis=0)  # (53, 3)
-            frames.append(frame)
-        return np.stack(frames, axis=0).astype(np.float32)  # (T, 53, 3)
+            pose_frames.append(frame)
+
+            # Expression: use zeros if key missing
+            if 'smplx_expr' in d:
+                expr = np.array(d['smplx_expr']).reshape(10,).astype(np.float32)
+            else:
+                expr = np.zeros(10, dtype=np.float32)
+            expr_frames.append(expr)
+
+        pose = np.stack(pose_frames, axis=0).astype(np.float32)  # (T, 53, 3)
+        expr = np.stack(expr_frames, axis=0).astype(np.float32)  # (T, 10)
+        return pose, expr
 
     # ==================== Sampling ====================
 
@@ -212,18 +223,20 @@ class How2SignSMPLXDataset(Dataset):
 
     # ==================== Sequence Processing ====================
 
-    def _process_sequence(self, joint_seq):
+    def _process_sequence(self, joint_seq, expr_seq=None):
         """
         Process a raw (T, 53, 3) axis-angle sequence into the final feature tensor.
 
         Pipeline:
             1. Select joints (53 → 44 if upper body)
-            2. Convert to 6D rotation (if enabled)
-            3. Root-relative normalization
-            4. Flatten to (T, input_dim)
+            2. Root-relative normalization
+            3. Convert to 6D rotation (if enabled)
+            4. Flatten pose to (T, pose_dim)
+            5. Concatenate expression (T, 10) if use_expression
 
         Args:
-            joint_seq: np.ndarray (T, 53, 3) axis-angle
+            joint_seq: np.ndarray (T, 53, 3)
+            expr_seq:  np.ndarray (T, 10) or None
 
         Returns:
             torch.Tensor (T, input_dim)
@@ -233,20 +246,22 @@ class How2SignSMPLXDataset(Dataset):
         # Step 1: Select joints
         seq = seq[:, self.joint_indices, :]  # (T, N_joints, 3)
 
-        # Step 2: Root-relative normalization (on axis-angle, before conversion)
-        # Subtract first frame's root orientation
-        # first_root = seq[0:1, 0:1, :].clone()  # (1, 1, 3)
+        # Step 2: Root-relative normalization
         if self.cfg.ROOT_NORMALIZE:
-            # seq[:, 0:1, :] = seq[:, 0:1, :] - first_root
             seq[:, 0:1, :] = 0.0
 
         # Step 3: Convert to 6D if enabled
         if self.use_rot6d:
             seq = axis_angle_to_rot6d(seq)  # (T, N_joints, 6)
 
-        # Step 4: Flatten
+        # Step 4: Flatten pose
         T = seq.shape[0]
-        seq = seq.reshape(T, -1)  # (T, input_dim)
+        seq = seq.reshape(T, -1)  # (T, pose_dim)
+
+        # Step 5: Append expression if enabled
+        if self.use_expression and expr_seq is not None:
+            expr = torch.from_numpy(expr_seq)  # (T, 10)
+            seq  = torch.cat([seq, expr], dim=-1)  # (T, pose_dim + 10)
 
         return seq
 
@@ -263,20 +278,18 @@ class How2SignSMPLXDataset(Dataset):
             indices       = self._sample_indices(len(pkl_paths))
             selected_pkls = [pkl_paths[i] for i in indices]
 
-            # Load → (T, 53, 3) axis-angle
-            pose = self._load_pose_from_pkls(selected_pkls)
+            # Load → pose (T, 53, 3) + expr (T, 10)
+            pose, expr = self._load_pose_from_pkls(selected_pkls)
 
             # Process: joint selection, rot6d, root-norm, flatten → (T, input_dim)
-            seq = self._process_sequence(pose)
+            seq = self._process_sequence(pose, expr if self.use_expression else None)
             actual_len = seq.shape[0]
 
-            # 用零填充，不用最后一帧填充
-            # pad last frame 会让模型学到虚假的静止分布
+            # Pad with zeros if shorter than target
             if actual_len < self.target_seq_len:
                 pad = torch.zeros(self.target_seq_len - actual_len, seq.shape[-1])
                 seq = torch.cat([seq, pad], dim=0)
 
-            # 多返回 actual_len，让 train 里能建正确的 padding_mask
             return seq, sentence, sentence, actual_len
 
         except Exception as e:
