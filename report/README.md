@@ -39,21 +39,44 @@ The previous "champion" in this codebase (kin · VoteOnly · LLM-gloss + phonolo
 
 When we render the paper-champion checkpoint side-by-side with the ground-truth signing motion, the FID number turns out to be **misleading**. The avatar produces plausible-looking signing-style motion, but the motion is **unrelated to the input sentence** — it does not match the GT for that sentence at all.
 
-### Sample 1 — sentence: *"and then there's the traditional ukulele felt..."*
+The generated avatar moves and produces signing-style hand articulation — which is what the FID is rewarding. But these motions are not the signs for the input sentence; they are something close to the *average* signing motion across the training set. **The model has learned `p(motion)` (the marginal), not `p(motion | sentence)`.** This pattern was visible across all 15 rendered samples for every checkpoint in the main table; below are seven representative cases.
 
+### Sample 1 — *"and then there's the traditional ukulele felt..."*
 | Generated (paper champion, FID 1.94) | Ground truth |
 |---|---|
 | ![gen](assets/exp1_paper_champion_FID1.94/00_idx51_and_then_there_s_the_traditional_ukulele_felt__w/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/00_idx51_and_then_there_s_the_traditional_ukulele_felt__w/gt.gif) |
 
-### Sample 2 — sentence: *"so you press it"*
+### Sample 2 — *"okay, what I want to talk about is where you should..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp1_paper_champion_FID1.94/01_idx209_okay__what_i_want_to_talk_about_is_where_you_sho/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/01_idx209_okay__what_i_want_to_talk_about_is_where_you_sho/gt.gif) |
 
+### Sample 3 — *"you could do a variety of cross cuts, rip cuts..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp1_paper_champion_FID1.94/02_idx228_you_could_do_a_variety_of_cross_cuts__rip_cuts/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/02_idx228_you_could_do_a_variety_of_cross_cuts__rip_cuts/gt.gif) |
+
+### Sample 4 — *"well, in the beginning doing well in school is..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp1_paper_champion_FID1.94/03_idx285_well__in_the_beginning_doing_well_in_school_is_p/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/03_idx285_well__in_the_beginning_doing_well_in_school_is_p/gt.gif) |
+
+### Sample 5 — *"after we did our consultation with our client..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp1_paper_champion_FID1.94/04_idx457_after_we_did_our_consultation_with_our_client_fr/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/04_idx457_after_we_did_our_consultation_with_our_client_fr/gt.gif) |
+
+### Sample 6 — *"so you press it"*
 | Generated | Ground truth |
 |---|---|
 | ![gen](assets/exp1_paper_champion_FID1.94/06_idx563_so_you_press_it/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/06_idx563_so_you_press_it/gt.gif) |
 
-The generated avatar moves and produces signing-style hand articulation — that is what the FID is rewarding. But these motions are not the signs for the input sentence; they are something close to the *average* signing motion across the training set. **The model has learned `p(motion)` (the marginal), not `p(motion | sentence)`.**
+### Sample 7 — *"then you remove the extra cream, apply the pack..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp1_paper_champion_FID1.94/08_idx1385_then_you_remove_the_extra_cream__apply_the_pack/generated.gif) | ![gt](assets/exp1_paper_champion_FID1.94/08_idx1385_then_you_remove_the_extra_cream__apply_the_pack/gt.gif) |
 
-This pattern was visible across all 15 rendered samples for every checkpoint in the main table.
+Across all seven sentences the GT signing motions are visibly distinct from one another. The generated motions are also moving, but each generated motion is close to a generic "signing-style" pose stream that does not encode the specific content of its input sentence.
 
 ---
 
@@ -66,24 +89,29 @@ Hypothesis: the loss is too forgiving on small hand/wrist deviations, so the mod
 
 ### 3.1 Result — FK loss did make the motion bigger, but not faithful
 
-Side-by-side renders of the FK-retrained kin · VoteOnly · LLM checkpoint:
+Side-by-side renders of the FK-retrained champion (kin · CFG · sent, FID 2.36 / FID_AE 2.96):
 
 #### Sample A — *"boom, just like that"*
 | Generated (FK retrain) | Ground truth |
 |---|---|
-| ![gen](assets/exp2_fk_retrain/00_idx102_boom__just_like_that/generated.gif) | ![gt](assets/exp2_fk_retrain/00_idx102_boom__just_like_that/gt.gif) |
+| ![gen](assets/exp2_fk_retrain/01_boom_just_like_that/generated.gif) | ![gt](assets/exp2_fk_retrain/01_boom_just_like_that/gt.gif) |
 
 #### Sample B — *"so we take this, pull it down like so"*
 | Generated | Ground truth |
 |---|---|
-| ![gen](assets/exp2_fk_retrain/06_idx456_so_we_take_this__pull_it_down_like_so/generated.gif) | ![gt](assets/exp2_fk_retrain/06_idx456_so_we_take_this__pull_it_down_like_so/gt.gif) |
+| ![gen](assets/exp2_fk_retrain/00_so_we_take_this_pull_it_down_like_so/generated.gif) | ![gt](assets/exp2_fk_retrain/00_so_we_take_this_pull_it_down_like_so/gt.gif) |
 
 #### Sample C — *"now it's your responsibility to provide the healthy..."*
 | Generated | Ground truth |
 |---|---|
-| ![gen](assets/exp2_fk_retrain/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/generated.gif) | ![gt](assets/exp2_fk_retrain/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/gt.gif) |
+| ![gen](assets/exp2_fk_retrain/04_now_its_your_responsibility_to_provide_t/generated.gif) | ![gt](assets/exp2_fk_retrain/04_now_its_your_responsibility_to_provide_t/gt.gif) |
 
-The arms now move with realistic amplitude and the hand shapes are anatomically valid. But the motion is **still unrelated** to the input sentence — the avatar appears to be performing *some* signing gesture, just not the gesture that corresponds to the GT.
+#### Sample D — *"depending on the focus, if it's a high-intensity..."*
+| Generated | Ground truth |
+|---|---|
+| ![gen](assets/exp2_fk_retrain/03_depending_on_the_focus_if_its_a_high_int/generated.gif) | ![gt](assets/exp2_fk_retrain/03_depending_on_the_focus_if_its_a_high_int/gt.gif) |
+
+The arms now move with realistic amplitude and the hand shapes are anatomically valid — the FK joint position loss did its job. But the motion is **still unrelated** to the input sentence — the avatar performs some signing gesture in each case, just not the gesture that corresponds to the GT.
 
 ### 3.2 FK retrain — full table (post-fix, paper-ready)
 
@@ -207,19 +235,19 @@ The diagnostic numbers say it; the rendered videos confirm it visually. Below ar
 
 | Ground truth (different per sentence) | Clean regression 13K | Clean regression 26K |
 |---|---|---|
-| ![gt](assets/exp2_fk_retrain/00_idx102_boom__just_like_that/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/00_idx102_boom__just_like_that/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/00_idx102_boom__just_like_that/generated.gif) |
+| ![gt](assets/exp2_fk_retrain/01_boom_just_like_that/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/00_idx102_boom__just_like_that/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/00_idx102_boom__just_like_that/generated.gif) |
 
 #### Sentence B — *"so we take this, pull it down like so"*
 
 | Ground truth | Clean regression 13K | Clean regression 26K |
 |---|---|---|
-| ![gt](assets/exp2_fk_retrain/06_idx456_so_we_take_this__pull_it_down_like_so/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/06_idx456_so_we_take_this__pull_it_down_like_so/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/06_idx456_so_we_take_this__pull_it_down_like_so/generated.gif) |
+| ![gt](assets/exp2_fk_retrain/00_so_we_take_this_pull_it_down_like_so/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/06_idx456_so_we_take_this__pull_it_down_like_so/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/06_idx456_so_we_take_this__pull_it_down_like_so/generated.gif) |
 
 #### Sentence C — *"now it's your responsibility to provide the healthy..."*
 
 | Ground truth | Clean regression 13K | Clean regression 26K |
 |---|---|---|
-| ![gt](assets/exp2_fk_retrain/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/generated.gif) |
+| ![gt](assets/exp2_fk_retrain/04_now_its_your_responsibility_to_provide_t/gt.gif) | ![13K](assets/exp4a_clean_regression_13K/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/generated.gif) | ![26K](assets/exp4b_clean_regression_26K/09_idx914_now_it_s_your_responsibility_to_provide_the_heal/generated.gif) |
 
 The GT column shows three distinct signing motions for three distinct sentences. The two regression columns are visibly identical across all three rows — the model produces one frozen average pose regardless of input.
 
