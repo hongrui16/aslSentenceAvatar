@@ -288,21 +288,43 @@ class NeuralSignActorsModel(nn.Module):
         self.n_expr      = n_expr
 
         # ── bypass / active joint logic ────────────────────────────────────────
-        # The dataset omits some joints from the flat tensor based on config flags.
-        # We reconstruct the full 53-joint tensor with zeros for bypassed joints,
-        # pass everything through the GNN, then extract only active joints.
-        joint_groups  = get_joint_slices(n_feats=n_feats)
-        all_slices    = joint_groups['ALL']          # 53*n_feats feature indices
-        bypass_slices = []
-        if cfg.ROOT_NORMALIZE:
-            bypass_slices += joint_groups['ROOT']
-        if cfg.USE_UPPER_BODY:
-            bypass_slices += joint_groups['LOWER_BODY']
-        bypass_set    = set(bypass_slices)
-        tosave_slices = [i for i in all_slices if i not in bypass_set]
+        # USE_3D_INPUT: dataset has no SMPL-X kinematic tree (Phoenix MediaPipe
+        # coords or How2Sign-3D body+hand 3D coords). Skip joint-group bypass and
+        # GNN encoder; use a flat linear projection instead. This keeps NSA's
+        # core (diffusion + LSTM + per-joint weighted L2 loss) but drops the
+        # GNN, since the GNN's anisotropic edges are SMPL-X-specific.
+        self.use_3d_input = bool(getattr(cfg, 'USE_3D_INPUT', False))
 
-        # Which of the 53 joints are active (have non-zero features in input)
-        active_joints = sorted(set(s // n_feats for s in tosave_slices))
+        if self.use_3d_input:
+            input_dim = int(cfg.INPUT_DIM)
+            assert input_dim % n_feats == 0, \
+                f"INPUT_DIM={input_dim} not divisible by N_FEATS={n_feats}"
+            n_active = input_dim // n_feats
+            all_slices    = list(range(input_dim))
+            tosave_slices = list(range(input_dim))
+            active_joints = list(range(n_active))
+            # Expression is SMPL-X specific — disable for 3D-input mode.
+            use_expr = False
+            self.use_expr = False
+        else:
+            # The dataset omits some joints from the flat tensor based on config
+            # flags. We reconstruct the full 53-joint tensor with zeros for
+            # bypassed joints, pass everything through the GNN, then extract
+            # only active joints.
+            joint_groups  = get_joint_slices(n_feats=n_feats)
+            all_slices    = joint_groups['ALL']          # 53*n_feats feature indices
+            bypass_slices = []
+            if cfg.ROOT_NORMALIZE:
+                bypass_slices += joint_groups['ROOT']
+            if cfg.USE_UPPER_BODY:
+                bypass_slices += joint_groups['LOWER_BODY']
+            if getattr(cfg, 'EXCLUDE_JAW', False):
+                bypass_slices += joint_groups['JAW']
+            bypass_set    = set(bypass_slices)
+            tosave_slices = [i for i in all_slices if i not in bypass_set]
+
+            # Which of the 53 joints are active (have non-zero features in input)
+            active_joints = sorted(set(s // n_feats for s in tosave_slices))
         n_active      = len(active_joints)
 
         self.all_slices    = all_slices
@@ -325,34 +347,63 @@ class NeuralSignActorsModel(nn.Module):
         self.register_buffer('sqrt_acp',             acp.sqrt())
         self.register_buffer('sqrt_one_minus_acp',   (1.0 - acp).sqrt())
 
-        # ── 1. CLIP-ViT-L-14 text encoder (frozen) ────────────────────────────
-        clip_name = getattr(cfg, 'CLIP_MODEL_NAME', 'openai/clip-vit-large-patch14')
-        print(f"[NeuralSignActors] Loading {clip_name} ...")
-        self.tokenizer    = CLIPTokenizer.from_pretrained(clip_name)
-        self.text_encoder = CLIPTextModel.from_pretrained(clip_name)
+        # ── 1. Text encoder (frozen) — CLIP (English) or mclip (multilingual)
+        self.text_encoder_type = getattr(cfg, 'TEXT_ENCODER_TYPE', 'clip').lower()
+        if self.text_encoder_type == 'mclip':
+            from transformers import AutoTokenizer, AutoModel
+            mclip_name = getattr(cfg, 'MCLIP_MODEL_NAME', 'xlm-roberta-base')
+            print(f"[NeuralSignActors] Loading multilingual encoder {mclip_name} ...")
+            self.tokenizer    = AutoTokenizer.from_pretrained(mclip_name)
+            self.text_encoder = AutoModel.from_pretrained(mclip_name)
+            text_dim = self.text_encoder.config.hidden_size
+        else:
+            clip_name = getattr(cfg, 'CLIP_MODEL_NAME', 'openai/clip-vit-large-patch14')
+            print(f"[NeuralSignActors] Loading {clip_name} ...")
+            self.tokenizer    = CLIPTokenizer.from_pretrained(clip_name)
+            self.text_encoder = CLIPTextModel.from_pretrained(clip_name)
+            text_dim = self.text_encoder.config.hidden_size  # 768 for ViT-L-14
         for p in self.text_encoder.parameters():
             p.requires_grad = False
         self.text_encoder.eval()
 
-        clip_dim  = self.text_encoder.config.hidden_size  # 768 for ViT-L-14
         self.cond_proj = nn.Sequential(
-            nn.Linear(clip_dim, lstm_hidden),
+            nn.Linear(text_dim, lstm_hidden),
             nn.GELU(),
             nn.Linear(lstm_hidden, lstm_hidden),
         )
         cond_dim = lstm_hidden
 
-        # ── 2. GNN pose encoder ───────────────────────────────────────────────
-        self.pose_encoder = GNNPoseEncoder(
-            n_feats   = n_feats,
-            base_dim  = base_dim,
-            cond_dim  = cond_dim,
-            n_layers  = n_gnn_layers,
-        )
-        gnn_out_dim = self.pose_encoder.out_dim   # e.g. 512 for base_dim=128, 4 layers
+        # ── 2. GNN pose encoder (SMPL-X) or flat MLP (3D-input) ───────────────
+        if self.use_3d_input:
+            # No GNN — MediaPipe / How2Sign-3D topology is not SMPL-X.
+            # Per-joint MLP keeps the "encode each joint independently then
+            # flatten" structure of NSA without baking in the wrong tree.
+            self.pose_encoder = None
+            per_joint_hidden = base_dim * 2          # mirror GNN final width
+            self.pose_per_joint = nn.Sequential(
+                nn.Linear(n_feats, base_dim),
+                nn.GELU(),
+                nn.LayerNorm(base_dim),
+                nn.Linear(base_dim, per_joint_hidden),
+                nn.GELU(),
+                nn.LayerNorm(per_joint_hidden),
+            )
+            self.pose_flat_proj = nn.Linear(n_active * per_joint_hidden, lstm_hidden)
+            self.pose_flat_norm = nn.LayerNorm(lstm_hidden)
+        else:
+            self.pose_encoder = GNNPoseEncoder(
+                n_feats   = n_feats,
+                base_dim  = base_dim,
+                cond_dim  = cond_dim,
+                n_layers  = n_gnn_layers,
+            )
+            gnn_out_dim = self.pose_encoder.out_dim   # e.g. 512 for base_dim=128, 4 layers
 
-        # Project flattened GNN output → lstm_hidden
-        self.pose_flat_proj = nn.Linear(n_active * gnn_out_dim, lstm_hidden)
+            # Project flattened GNN output → lstm_hidden, with output LayerNorm
+            # to prevent variance explosion in this large fan-in (12800→512) layer.
+            # Without this, the output std is ~200 which causes downstream collapse.
+            self.pose_flat_proj = nn.Linear(n_active * gnn_out_dim, lstm_hidden)
+            self.pose_flat_norm = nn.LayerNorm(lstm_hidden)
 
         # ── 3. MLP expression encoder (optional) ──────────────────────────────
         if use_expr:
@@ -424,13 +475,19 @@ class NeuralSignActorsModel(nn.Module):
 
     # ── text conditioning ─────────────────────────────────────────────────────
     def get_condition(self, sentences, device) -> torch.Tensor:
-        """CLIP-ViT-L-14 → (B, lstm_hidden)"""
+        """Text → (B, lstm_hidden). CLIP uses pooler_output (EOT token);
+        mclip uses mask-aware mean over last_hidden_state."""
         with torch.no_grad():
             inputs = self.tokenizer(
                 sentences, padding=True, truncation=True,
                 max_length=77, return_tensors='pt'
             ).to(device)
-            raw = self.text_encoder(**inputs).pooler_output  # (B, clip_dim)
+            if self.text_encoder_type == 'mclip':
+                hidden = self.text_encoder(**inputs).last_hidden_state
+                attn = inputs['attention_mask'].unsqueeze(-1).float()
+                raw = (hidden * attn).sum(dim=1) / attn.sum(dim=1).clamp(min=1e-9)
+            else:
+                raw = self.text_encoder(**inputs).pooler_output  # (B, clip_dim)
         return self.cond_proj(raw)   # (B, lstm_hidden)
 
     # ── diffusion forward ─────────────────────────────────────────────────────
@@ -462,18 +519,26 @@ class NeuralSignActorsModel(nn.Module):
         # ── split pose / expression ───────────────────────────────────────────
         pose_flat = x_t_active[..., :self.pose_input_dim]  # (B, F, n_active*n_feats)
 
-        # Expand to full (B, F, 53, n_feats) with zeros for bypassed joints
-        theta_full = torch.zeros(
-            B, Frames, N_JOINTS, self.n_feats, device=device, dtype=x_t_active.dtype
-        )
-        for new_i, orig_i in enumerate(self.active_joints):
-            s = slice(new_i * self.n_feats, (new_i + 1) * self.n_feats)
-            theta_full[:, :, orig_i, :] = pose_flat[..., s]
+        if self.use_3d_input:
+            # Per-joint MLP path (Phoenix MediaPipe / How2Sign-3D coords).
+            theta_jp = pose_flat.view(B, Frames, self.n_active, self.n_feats)
+            h_pose   = self.pose_per_joint(theta_jp)          # (B, F, n_active, ph)
+            h_pose   = self.pose_flat_proj(h_pose.flatten(2)) # (B, F, lstm_hidden)
+            h_pose   = self.pose_flat_norm(h_pose)
+        else:
+            # Expand to full (B, F, 53, n_feats) with zeros for bypassed joints
+            theta_full = torch.zeros(
+                B, Frames, N_JOINTS, self.n_feats, device=device, dtype=x_t_active.dtype
+            )
+            for new_i, orig_i in enumerate(self.active_joints):
+                s = slice(new_i * self.n_feats, (new_i + 1) * self.n_feats)
+                theta_full[:, :, orig_i, :] = pose_flat[..., s]
 
-        # ── GNN pose encoder ──────────────────────────────────────────────────
-        h_full = self.pose_encoder(theta_full, cond)          # (B, F, 53, gnn_out)
-        h_pose = h_full[:, :, self.active_joints, :]          # (B, F, n_active, gnn_out)
-        h_pose = self.pose_flat_proj(h_pose.flatten(2))       # (B, F, lstm_hidden)
+            # ── GNN pose encoder ──────────────────────────────────────────────
+            h_full = self.pose_encoder(theta_full, cond)          # (B, F, 53, gnn_out)
+            h_pose = h_full[:, :, self.active_joints, :]          # (B, F, n_active, gnn_out)
+            h_pose = self.pose_flat_proj(h_pose.flatten(2))       # (B, F, lstm_hidden)
+            h_pose = self.pose_flat_norm(h_pose)                  # critical: stabilize scale
 
         # ── expression encoder ────────────────────────────────────────────────
         parts = [h_pose]
@@ -602,12 +667,22 @@ def nsa_loss(eps_pred: torch.Tensor,
              n_feats: int,
              active_joints: list,
              use_expr: bool = False,
-             n_expr: int = 10) -> torch.Tensor:
+             n_expr: int = 10,
+             loss_type: str = 'mse',
+             hand_joints_override: set = None) -> torch.Tensor:
     """
     Paper Eq. 7:   L_t = || ε_t − ε_Θ ||_2
 
-    Hand joints (left + right) contribute with weight 2×.
-    All other joints contribute with weight 1×.
+    loss_type='mse'  : ||·||_2^2 (squared) — standard diffusion loss, may collapse.
+    loss_type='l2'   : ||·||_2 (unsquared, per-joint) — matches paper literally;
+                       gradient magnitude is constant 1/||err||, prevents zero
+                       collapse that MSE suffers from when prediction → 0.
+
+    Hand joints (left + right) contribute with weight 2× (5× when Phoenix).
+
+    hand_joints_override: optional set of joint indices to treat as "hand"
+        instead of the default SMPL-X LHAND/RHAND sets. Used by Phoenix where
+        joint topology is MediaPipe (body 25 + lhand 21 + rhand 21).
 
     eps_pred, eps_true: (B, T, noise_dim)
     padding_mask:       (B, T)  True = padded
@@ -617,15 +692,29 @@ def nsa_loss(eps_pred: torch.Tensor,
     loss = torch.tensor(0.0, device=eps_pred.device, dtype=eps_pred.dtype)
     n_pose_feats = len(active_joints) * n_feats
 
+    # Uniform per-joint weighting (no hand boost). The hand-boosted variant
+    # over-fits hand marginals at the expense of arm trajectories — see the
+    # mode-collapse diagnosis in tools/diagnose_mode_collapse.py.
+    def _per_joint(err):
+        if loss_type == 'l2':
+            # L2 norm per (B,T,joint), masked, averaged
+            norm = torch.sqrt((err ** 2).sum(dim=-1) + 1e-6)   # (B, T)
+            return (norm * valid.squeeze(-1)).sum() / (valid.sum() + 1e-8)
+        else:
+            return (err ** 2 * valid).sum() / (valid.sum() * n_feats + 1e-8)
+
     for new_i, orig_i in enumerate(active_joints):
         sl  = slice(new_i * n_feats, (new_i + 1) * n_feats)
-        w   = 2.0 if orig_i in LHAND_SET or orig_i in RHAND_SET else 1.0
-        err = (eps_pred[..., sl] - eps_true[..., sl]) ** 2   # (B, T, n_feats)
-        loss = loss + w * (err * valid).sum() / (valid.sum() * n_feats + 1e-8)
+        err = eps_pred[..., sl] - eps_true[..., sl]            # (B, T, n_feats)
+        loss = loss + _per_joint(err)
 
     if use_expr:
         sl  = slice(n_pose_feats, n_pose_feats + n_expr)
-        err = (eps_pred[..., sl] - eps_true[..., sl]) ** 2
-        loss = loss + (err * valid).sum() / (valid.sum() * n_expr + 1e-8)
+        err = eps_pred[..., sl] - eps_true[..., sl]
+        if loss_type == 'l2':
+            norm = torch.sqrt((err ** 2).sum(dim=-1) + 1e-6)
+            loss = loss + (norm * valid.squeeze(-1)).sum() / (valid.sum() + 1e-8)
+        else:
+            loss = loss + (err ** 2 * valid).sum() / (valid.sum() * n_expr + 1e-8)
 
     return loss

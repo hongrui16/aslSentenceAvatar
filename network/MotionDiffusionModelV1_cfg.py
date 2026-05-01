@@ -39,9 +39,11 @@ from transformers import CLIPTokenizer, CLIPTextModel
 from transformers import (
     CLIPTokenizer, CLIPTextModel,
     T5Tokenizer, T5EncoderModel,
+    AutoTokenizer, AutoModel,
 )
 
 from utils.rotation_conversion import LOWER_BODY_INDICES, ROOT_INDICES, TORSO_INDICES, ALL_INDICES, get_joint_slices
+from network.PhonoAttributeEncoder import PhonoAttributeEncoder
 
 # =============================================================================
 # Utilities (same as V1)
@@ -96,20 +98,29 @@ class MotionDiffusionModelV1_CFG(nn.Module):
         self.prediction_type = getattr(cfg, 'PREDICTION_TYPE', 'epsilon')
         self.uncond_prob = getattr(cfg, 'UNCOND_PROB', 0.1)
 
-        joint_groups = get_joint_slices(n_feats=cfg.N_FEATS)
-        root_slices = joint_groups['ROOT']
-        lower_body_slices = joint_groups['LOWER_BODY']
-        self.all_slices = joint_groups['ALL']
+        # USE_3D_INPUT (and Phoenix-2D, which sets it via the trainer) means the
+        # dataset emits raw flat features without SMPL-X joint-group structure,
+        # so the model treats every dim as active and skips bypass.
+        self.use_3d_input = bool(getattr(cfg, 'USE_3D_INPUT', False))
+        if self.use_3d_input:
+            self.all_slices    = list(range(self.input_dim))
+            self.tosave_slices = list(range(self.input_dim))
+            self.bypass_slices = []
+        else:
+            joint_groups = get_joint_slices(n_feats=cfg.N_FEATS)
+            root_slices = joint_groups['ROOT']
+            lower_body_slices = joint_groups['LOWER_BODY']
+            self.all_slices = joint_groups['ALL']
 
-        self.bypass_slices = []
-        if cfg.ROOT_NORMALIZE:
-            self.input_dim -= len(ROOT_INDICES) * cfg.N_FEATS
-            self.bypass_slices += root_slices
-        if cfg.USE_UPPER_BODY:
-            self.input_dim -= len(LOWER_BODY_INDICES) * cfg.N_FEATS
-            self.bypass_slices += lower_body_slices
+            self.bypass_slices = []
+            if cfg.ROOT_NORMALIZE:
+                self.input_dim -= len(ROOT_INDICES) * cfg.N_FEATS
+                self.bypass_slices += root_slices
+            if cfg.USE_UPPER_BODY:
+                self.input_dim -= len(LOWER_BODY_INDICES) * cfg.N_FEATS
+                self.bypass_slices += lower_body_slices
 
-        self.tosave_slices = [i for i in self.all_slices if i not in set(self.bypass_slices)]
+            self.tosave_slices = [i for i in self.all_slices if i not in set(self.bypass_slices)]
 
         # Diffusion params
         self.num_timesteps = getattr(cfg, 'NUM_DIFFUSION_STEPS', 1000)
@@ -138,6 +149,26 @@ class MotionDiffusionModelV1_CFG(nn.Module):
                 nn.GELU(),
                 nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
             )
+        elif self.text_encoder_type == 'mclip':
+            # Multilingual encoder for non-English datasets (Phoenix-2014T DE).
+            # Loads via AutoModel/AutoTokenizer; sentence repr = mask-aware mean
+            # pool over last_hidden_state. Default: xlm-roberta-base (768-d).
+            mclip_name = getattr(cfg, 'MCLIP_MODEL_NAME', 'xlm-roberta-base')
+            print(f"Loading multilingual encoder: {mclip_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(mclip_name)
+            self.text_encoder = AutoModel.from_pretrained(mclip_name)
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
+            self.text_encoder.eval()
+
+            mclip_dim = self.text_encoder.config.hidden_size
+            self.condition_proj = nn.Sequential(
+                nn.Linear(mclip_dim, cfg.MODEL_DIM),
+                nn.GELU(),
+                nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
+                nn.GELU(),
+                nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
+            )
         else:
             clip_name = getattr(cfg, 'CLIP_MODEL_NAME', 'openai/clip-vit-base-patch32')
             print(f"Loading CLIP model: {clip_name}...")
@@ -161,10 +192,13 @@ class MotionDiffusionModelV1_CFG(nn.Module):
 
         # ==================== 1b. Gloss Condition (for cond_mode='gloss'|'sentence_gloss') ==
         self.cond_mode = getattr(cfg, 'COND_MODE', 'sentence')
+        self.gloss_encoding = getattr(cfg, 'GLOSS_ENCODING', 'per_word')
         if self.cond_mode in ('gloss', 'sentence_gloss') and not self.use_label_index:
             # Separate projection for pseudo-gloss text (shares the frozen text encoder)
             if self.text_encoder_type == 't5':
                 raw_dim = self.text_encoder.config.d_model
+            elif self.text_encoder_type == 'mclip':
+                raw_dim = self.text_encoder.config.hidden_size
             else:
                 raw_dim = getattr(cfg, 'CLIP_DIM', 512)
             self.gloss_proj = nn.Sequential(
@@ -174,6 +208,19 @@ class MotionDiffusionModelV1_CFG(nn.Module):
                 nn.GELU(),
                 nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
             )
+
+            # Phonological attribute conditioning
+            self.use_phono = getattr(cfg, 'USE_PHONO', False)
+            phono_dim = getattr(cfg, 'PHONO_DIM', 64) if self.use_phono else 0
+            if self.use_phono:
+                from utils.signbank_phono import SignBankPhonoLookup
+                signbank_csv = getattr(cfg, 'SIGNBANK_CSV',
+                                       'data/ASL_signbank/asl_signbank_dictionary-export.csv')
+                self.phono_lookup = SignBankPhonoLookup(signbank_csv)
+                self.phono_encoder = PhonoAttributeEncoder(
+                    self.phono_lookup.num_classes, phono_dim=phono_dim,
+                )
+                self.gloss_phono_proj = nn.Linear(raw_dim + phono_dim, raw_dim)
 
         # ==================== 2. Timestep Embedding ====================
         self.timestep_proj = nn.Sequential(
@@ -186,15 +233,29 @@ class MotionDiffusionModelV1_CFG(nn.Module):
         self.pose_proj = nn.Linear(self.input_dim, cfg.MODEL_DIM)
         self.pe = PositionalEncoding(cfg.MODEL_DIM, getattr(cfg, 'MAX_SEQ_LEN', 200) + 10)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.MODEL_DIM,
-            nhead=cfg.N_HEADS,
-            dim_feedforward=cfg.MODEL_DIM * 4,
-            dropout=cfg.DROPOUT,
-            activation='gelu',
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=cfg.N_LAYERS)
+        # Denoiser variant — `MODEL_ARCH` selects:
+        #   'mdm' (default) | 'kin' | 'vel' | 'ms'
+        self.model_arch = getattr(cfg, 'MODEL_ARCH', 'mdm').lower()
+        if self.model_arch == 'mdm':
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=cfg.MODEL_DIM,
+                nhead=cfg.N_HEADS,
+                dim_feedforward=cfg.MODEL_DIM * 4,
+                dropout=cfg.DROPOUT,
+                activation='gelu',
+                batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=cfg.N_LAYERS)
+        else:
+            from network.MotionDenoiserVariants import build_denoiser
+            self.transformer = build_denoiser(
+                arch=self.model_arch,
+                d_model=cfg.MODEL_DIM, nhead=cfg.N_HEADS,
+                dim_feedforward=cfg.MODEL_DIM * 4,
+                dropout=cfg.DROPOUT, num_layers=cfg.N_LAYERS,
+                max_T=getattr(cfg, 'MAX_SEQ_LEN', 200),
+            )
+            print(f"[MDM] using denoiser variant: {self.model_arch}")
 
         self.output_proj = nn.Sequential(
             nn.Linear(cfg.MODEL_DIM, cfg.MODEL_DIM),
@@ -234,8 +295,19 @@ class MotionDiffusionModelV1_CFG(nn.Module):
 
     # ------------------------------------------------------------------ condition
     def _encode_text(self, text_input, device):
-        """Encode text with frozen CLIP/T5, return raw embedding (before projection)."""
+        """Encode text with frozen CLIP/T5/mclip, return raw embedding (before projection)."""
         if self.text_encoder_type == 't5':
+            inputs = self.tokenizer(
+                text_input, padding=True, truncation=True,
+                max_length=77, return_tensors="pt"
+            ).to(device)
+            with torch.no_grad():
+                hidden = self.text_encoder(**inputs).last_hidden_state
+                attn_mask = inputs['attention_mask'].unsqueeze(-1).float()
+                pooled = (hidden * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp(min=1e-9)
+            return pooled
+        elif self.text_encoder_type == 'mclip':
+            # Multilingual encoder via AutoModel — mean-pool last_hidden_state.
             inputs = self.tokenizer(
                 text_input, padding=True, truncation=True,
                 max_length=77, return_tensors="pt"
@@ -253,12 +325,81 @@ class MotionDiffusionModelV1_CFG(nn.Module):
             with torch.no_grad():
                 return self.text_encoder(**inputs).pooler_output
 
+    def _embed_phono(self, gloss_strings, max_K, device):
+        """Look up SignBank phono attributes and encode them."""
+        if not getattr(self, 'use_phono', False):
+            return None
+
+        from utils.signbank_phono import PHONO_ATTRIBUTES
+        B = len(gloss_strings)
+        n_attrs = len(PHONO_ATTRIBUTES)
+        attr_indices = torch.zeros(B, max_K, n_attrs, dtype=torch.long, device=device)
+        found_mask = torch.zeros(B, max_K, dtype=torch.bool, device=device)
+
+        for i, gloss_str in enumerate(gloss_strings):
+            words = gloss_str.split()[:max_K] if gloss_str.strip() else ['']
+            for j, w in enumerate(words):
+                attrs = self.phono_lookup.get_attribute_indices(w)
+                if attrs is not None:
+                    found_mask[i, j] = True
+                    for k, attr_name in enumerate(PHONO_ATTRIBUTES):
+                        attr_indices[i, j, k] = attrs[attr_name]
+
+        return self.phono_encoder(attr_indices, found_mask)
+
+    def _encode_gloss_words_pooled(self, gloss_strings, device):
+        """Encode each gloss word individually through CLIP, optionally fuse phono, then mean pool."""
+        word_lists = [g.split() if g.strip() else [''] for g in gloss_strings]
+        lengths = [len(wl) for wl in word_lists]
+        max_K = max(lengths)
+        all_words = [w for wl in word_lists for w in wl]
+
+        with torch.no_grad():
+            tokens = self.tokenizer(
+                all_words, padding=True, truncation=True,
+                max_length=77, return_tensors='pt',
+            ).to(device)
+            if self.text_encoder_type in ('t5', 'mclip'):
+                hidden = self.text_encoder(**tokens).last_hidden_state
+                attn = tokens['attention_mask'].unsqueeze(-1).float()
+                word_embs = (hidden * attn).sum(1) / attn.sum(1).clamp(min=1e-9)
+            else:
+                word_embs = self.text_encoder(**tokens).pooler_output
+
+        B = len(gloss_strings)
+        enc_dim = word_embs.shape[-1]
+
+        # Fuse phono attributes per-word before pooling
+        if getattr(self, 'use_phono', False):
+            per_word = torch.zeros(B, max_K, enc_dim, device=device, dtype=word_embs.dtype)
+            idx = 0
+            for i, length in enumerate(lengths):
+                per_word[i, :length] = word_embs[idx:idx + length]
+                idx += length
+
+            phono_tokens = self._embed_phono(gloss_strings, max_K, device)
+            fused = torch.cat([per_word, phono_tokens], dim=-1)
+            per_word = self.gloss_phono_proj(fused)
+
+            pooled = torch.zeros(B, enc_dim, device=device, dtype=per_word.dtype)
+            for i, length in enumerate(lengths):
+                pooled[i] = per_word[i, :length].mean(dim=0)
+            return pooled
+
+        pooled = torch.zeros(B, enc_dim, device=device, dtype=word_embs.dtype)
+        idx = 0
+        for i, length in enumerate(lengths):
+            pooled[i] = word_embs[idx:idx + length].mean(dim=0)
+            idx += length
+
+        return pooled
+
     def get_condition(self, cond_input, device, gloss_input=None):
         """
         Build condition embedding based on self.cond_mode:
             'sentence'       : condition_proj(encode(sentence))
-            'gloss'          : gloss_proj(encode(gloss))
-            'sentence_gloss' : condition_proj(encode(sentence)) + gloss_proj(encode(gloss))
+            'gloss'          : gloss_proj(per-word CLIP mean pool)
+            'sentence_gloss' : condition_proj(encode(sentence)) + gloss_proj(per-word CLIP mean pool)
         """
         if self.use_label_index:
             if not isinstance(cond_input, torch.Tensor):
@@ -267,12 +408,17 @@ class MotionDiffusionModelV1_CFG(nn.Module):
 
         if self.cond_mode == 'gloss':
             assert gloss_input is not None, "gloss_input required for cond_mode='gloss'"
-            return self.gloss_proj(self._encode_text(gloss_input, device))
+            if self.gloss_encoding == 'whole_str':
+                return self.gloss_proj(self._encode_text(gloss_input, device))
+            return self.gloss_proj(self._encode_gloss_words_pooled(gloss_input, device))
 
         elif self.cond_mode == 'sentence_gloss':
             assert gloss_input is not None, "gloss_input required for cond_mode='sentence_gloss'"
             sent_emb  = self.condition_proj(self._encode_text(cond_input, device))
-            gloss_emb = self.gloss_proj(self._encode_text(gloss_input, device))
+            if self.gloss_encoding == 'whole_str':
+                gloss_emb = self.gloss_proj(self._encode_text(gloss_input, device))
+            else:
+                gloss_emb = self.gloss_proj(self._encode_gloss_words_pooled(gloss_input, device))
             return sent_emb + gloss_emb
 
         else:  # 'sentence' (default)
@@ -370,6 +516,19 @@ class MotionDiffusionModelV1_CFG(nn.Module):
         B = len(cond_input) if isinstance(cond_input, (list, tuple)) else cond_input.shape[0]
         condition = self.get_condition(cond_input, device, gloss_input=gloss_input)
         null_cond = self.null_cond_emb.unsqueeze(0).expand(B, -1)
+
+        # Regression mode: single forward pass, no DDIM loop.
+        if getattr(self.cfg, 'REGRESSION_MODE', False):
+            x0 = torch.zeros(B, seq_len, self.input_dim, device=device)
+            t0 = torch.zeros((B,), dtype=torch.long, device=device)
+            output = self.denoise(x0, t0, condition)
+            # Expand back to full all_slices (mirrors the DDIM tail at line 566+).
+            if len(self.all_slices) == len(self.tosave_slices):
+                return output
+            B_, T_, D = output.shape
+            out = torch.zeros(B_, T_, len(self.all_slices), dtype=output.dtype, device=device)
+            out[:, :, self.tosave_slices] = output
+            return out
 
         step_size = self.num_timesteps // num_steps
         timesteps = list(reversed(list(range(0, self.num_timesteps, step_size))))

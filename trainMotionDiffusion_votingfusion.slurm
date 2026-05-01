@@ -11,7 +11,7 @@
 #SBATCH --mem=40gb
 #SBATCH --export=ALL
 #SBATCH --time=4-24:00:00
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=4
 
 module load gnu10
 module load python
@@ -28,8 +28,8 @@ accelerate launch --num_processes=1 \
     --main_process_ip=localhost \
     --main_process_port=$PORT \
     trainMotionDiffusion_votingfusion.py \
-        --batch_size 100 \
-        --epochs 150 \
+        --batch_size 200 \
+        --epochs 100 \
         --voting_n_layers 2 \
         --voting_n_heads 4 \
         --fusion_n_layers 2 \

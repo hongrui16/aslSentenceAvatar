@@ -27,14 +27,18 @@ class How2SignSMPLXVotingDataset(How2SignSMPLXDataset):
 
     def __init__(self, mode='train', cfg=None, logger=None):
         super().__init__(mode=mode, cfg=cfg, logger=logger)
-        self._gloss_strings = self._load_llm_draft_cache(mode)
+        self._gloss_strings = self._load_llm_draft_cache(mode, cfg)
 
-    def _load_llm_draft_cache(self, mode):
-        cache_path = os.path.join(CACHE_DIR, f'llm_draft_gloss_{mode}.json')
+    def _load_llm_draft_cache(self, mode, cfg=None):
+        gloss_source = getattr(cfg, 'GLOSS_SOURCE', 'llm_draft') if cfg is not None else 'llm_draft'
+        if gloss_source == 'llm_shuffled':
+            cache_name = f'llm_draft_gloss_shuffled_{mode}.json'
+        else:
+            cache_name = f'llm_draft_gloss_{mode}.json'
+        cache_path = os.path.join(CACHE_DIR, cache_name)
         if not os.path.exists(cache_path):
             raise FileNotFoundError(
-                f"LLM draft cache not found at {cache_path}. "
-                f"Run: python tools/generate_llm_draft_gloss.py --modes {mode}"
+                f"LLM draft cache not found at {cache_path}."
             )
         with open(cache_path, 'r', encoding='utf-8') as f:
             cache = json.load(f)
@@ -57,6 +61,11 @@ class How2SignSMPLXVotingDataset(How2SignSMPLXDataset):
         return gloss_strings
 
     def __getitem__(self, idx):
-        seq, sentence, _, length = super().__getitem__(idx)
+        result = super().__getitem__(idx)
+        if self.use_fk_cache:
+            seq, sentence, _, length, gt_joints44 = result
+            gloss_string = self._gloss_strings[idx] if length > 0 else ''
+            return seq, sentence, gloss_string, length, gt_joints44
+        seq, sentence, _, length = result
         gloss_string = self._gloss_strings[idx] if length > 0 else ''
         return seq, sentence, gloss_string, length

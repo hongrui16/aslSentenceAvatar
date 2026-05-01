@@ -42,12 +42,50 @@ import pandas as pd
 from torch.utils.data import Dataset
 import sys
 import pickle
+from tqdm.auto import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from utils.rotation_conversion import axis_angle_to_rot6d, rot6d_to_axis_angle
 from utils.rotation_conversion import ALL_53_JOINTS, UPPER_BODY_INDICES, LOWER_BODY_INDICES, REMOVE_INDICES, FULL_JOINT_NAMES, ALL_INDICES
+
+
+def _load_one_sample(args):
+    """Module-level worker for parallel preload (must be picklable).
+
+    Source can be either a list of per-frame pkl paths (legacy) or a single
+    .npz path (aggregated). Returns (idx, pose, expr, err).
+    """
+    idx, source = args
+    try:
+        if isinstance(source, str) and source.endswith('.npz'):
+            d = np.load(source)
+            return idx, d['axis_angle'].astype(np.float32), \
+                   d['expression'].astype(np.float32), None
+        # legacy per-frame pkl list
+        pose_frames, expr_frames = [], []
+        for p in source:
+            with open(p, 'rb') as f:
+                d = pickle.load(f)
+            frame = np.concatenate([
+                np.array(d['smplx_root_pose']).reshape(1,  3),
+                np.array(d['smplx_body_pose']).reshape(21, 3),
+                np.array(d['smplx_lhand_pose']).reshape(15, 3),
+                np.array(d['smplx_rhand_pose']).reshape(15, 3),
+                np.array(d['smplx_jaw_pose']).reshape(1,  3),
+            ], axis=0)
+            pose_frames.append(frame)
+            if 'smplx_expr' in d:
+                expr_frames.append(np.array(d['smplx_expr']).reshape(10).astype(np.float32))
+            else:
+                expr_frames.append(np.zeros(10, dtype=np.float32))
+        pose = np.stack(pose_frames, axis=0).astype(np.float32)
+        expr = np.stack(expr_frames, axis=0).astype(np.float32)
+        return idx, pose, expr, None
+    except Exception as e:
+        return idx, None, None, str(e)
 
 
 class How2SignSMPLXDataset(Dataset):
@@ -78,9 +116,34 @@ class How2SignSMPLXDataset(Dataset):
         self.target_seq_len = getattr(cfg, 'TARGET_SEQ_LEN', 200)   if cfg else 200
         self.root_dir       = getattr(cfg, 'ROOT_DIR',        '/scratch/rhong5/dataset/Neural-Sign-Actors')   if cfg else '/scratch/rhong5/dataset/Neural-Sign-Actors'
         self.smplx_dir      = os.path.join(self.root_dir, f'{mode}_poses/poses')
+        self.aggregated_dir = os.path.join(self.root_dir, f'{mode}_poses_aggregated')
+        self.fk_joints_dir  = os.path.join(self.root_dir, f'{mode}_fk_joints44')
         self.xlsx_path      = os.path.join(self.root_dir, f'how2sign_realigned_{mode}.xlsx')
         self.camera         = getattr(cfg, 'CAMERA',          'rgb_front') if cfg else 'rgb_front'
         self.min_frames     = 10
+        self.preload        = getattr(cfg, 'PRELOAD_TO_MEMORY', False) if cfg else False
+        # Auto-detect: prefer per-sentence .npz when the aggregated dir exists.
+        # Set USE_AGGREGATED_NPZ=False explicitly to force the legacy pkl path.
+        self.use_aggregated = (
+            getattr(cfg, 'USE_AGGREGATED_NPZ', True) if cfg else True
+        ) and os.path.isdir(self.aggregated_dir)
+        # FK joints cache (T, 44, 3) precomputed via tools/precompute_fk_joints.py.
+        # When enabled, __getitem__ returns a 5-tuple with the GT joints so
+        # the FK loss can skip its GT FK call. Set tentatively here; the
+        # final value is re-checked after _load_all_samples() so a partial
+        # cache (dir exists but some files still being written) safely falls
+        # back to on-the-fly FK instead of crashing on FileNotFoundError.
+        self._fk_cache_requested = bool(
+            getattr(cfg, 'USE_FK_JOINTS_CACHE', False) if cfg else False
+        )
+        self.use_fk_cache = (
+            self._fk_cache_requested and os.path.isdir(self.fk_joints_dir)
+        )
+        # Sentence-length filter — drop very-short ("hi"/"yes") and very-long
+        # (>CLIP context) sentences. Applied at dataset-build time so train and
+        # eval see the same distribution. None disables.
+        self.filter_words_min = getattr(cfg, 'FILTER_WORDS_MIN', None) if cfg else None
+        self.filter_words_max = getattr(cfg, 'FILTER_WORDS_MAX', None) if cfg else None
 
         # Always emit the sparse 53-joint layout; models (V1/V2/NSA) handle
         # `use_upper_body` themselves via their own bypass/tosave_slices logic.
@@ -92,9 +155,48 @@ class How2SignSMPLXDataset(Dataset):
 
         # Data storage
         self.data_list = []   # [(sentence_str, pkl_paths_list), ...]
+        # Optional in-memory cache populated by _preload_all_pkls()
+        # When self.preload, __getitem__ uses these instead of opening pkls.
+        self.pose_cache = None  # list[np.ndarray (T, 53, 3)]
+        self.expr_cache = None  # list[np.ndarray (T, 10)]
+        # Instance-level blacklist of indices known to fail (e.g. corrupt
+        # source files / NaN). MUST be instance-level: train and val instances
+        # have different data_lists, so a bad idx in one is unrelated to the
+        # other.
+        self._bad_indices = set()
 
 
         self._load_all_samples()
+        if self.preload:
+            self._preload_all_pkls()
+
+        # Verify FK cache covers every sample. A partial cache (e.g. the
+        # precompute job is still running) auto-disables the cache path so
+        # training falls back to on-the-fly FK instead of crashing.
+        if self.use_fk_cache:
+            n_missing = 0
+            for stext, source in self.data_list:
+                if isinstance(source, str) and source.endswith('.npz'):
+                    sname = os.path.splitext(os.path.basename(source))[0]
+                else:
+                    sname = os.path.basename(os.path.dirname(source[0]))
+                if not os.path.exists(os.path.join(self.fk_joints_dir, f'{sname}.npz')):
+                    n_missing += 1
+            if n_missing > 0:
+                msg = (f"[{mode}] FK cache incomplete: {n_missing}/{len(self.data_list)} "
+                       f"samples missing in {self.fk_joints_dir} — "
+                       f"falling back to on-the-fly SMPL-X FK")
+                if self.logger is not None:
+                    self.logger.info(msg)
+                else:
+                    print(msg)
+                self.use_fk_cache = False
+            else:
+                msg = f"[{mode}] FK cache OK ({len(self.data_list)} files)"
+                if self.logger is not None:
+                    self.logger.info(msg)
+                else:
+                    print(msg)
 
         if self.logger is not None:
             self.logger.info(
@@ -105,53 +207,144 @@ class How2SignSMPLXDataset(Dataset):
     # ==================== Initialization ====================
 
     def _load_all_samples(self):
-        """Load (sentence, pkl_paths) pairs from xlsx + poses_root."""
+        """Build (sentence, source) list. Source is .npz path (aggregated path)
+        or list of pkl paths (legacy)."""
         df = pd.read_excel(self.xlsx_path)
 
         if self.camera is not None:
             df = df[df["SENTENCE_NAME"].str.contains(self.camera, na=False)]
 
         n_missing = n_short = n_corrupt = 0
-        for _, row in df.iterrows():
-            sname    = str(row["SENTENCE_NAME"]).strip()
-            stext    = str(row["SENTENCE"]).strip()
-            pose_dir = os.path.join(self.smplx_dir, sname)
 
-            if not os.path.isdir(pose_dir) or not stext:
-                n_missing += 1
-                continue
+        n_filtered_words = 0
+        if self.use_aggregated:
+            for _, row in df.iterrows():
+                sname = str(row["SENTENCE_NAME"]).strip()
+                stext = str(row["SENTENCE"]).strip()
+                if not stext:
+                    n_missing += 1
+                    continue
+                # Sentence-length filter (word count)
+                w = len(stext.split())
+                if self.filter_words_min is not None and w < self.filter_words_min:
+                    n_filtered_words += 1
+                    continue
+                if self.filter_words_max is not None and w > self.filter_words_max:
+                    n_filtered_words += 1
+                    continue
+                npz_path = os.path.join(self.aggregated_dir, f"{sname}.npz")
+                if not os.path.exists(npz_path):
+                    n_missing += 1
+                    continue
+                self.data_list.append((stext, npz_path))
+        else:
+            for _, row in df.iterrows():
+                sname    = str(row["SENTENCE_NAME"]).strip()
+                stext    = str(row["SENTENCE"]).strip()
+                pose_dir = os.path.join(self.smplx_dir, sname)
 
-            pkls = sorted([
-                os.path.join(pose_dir, f)
-                for f in os.listdir(pose_dir)
-                if f.endswith(".pkl")
-            ])
-            if len(pkls) < self.min_frames:
-                n_short += 1
-                continue
+                if not os.path.isdir(pose_dir) or not stext:
+                    n_missing += 1
+                    continue
+                # Sentence-length filter (word count)
+                w = len(stext.split())
+                if self.filter_words_min is not None and w < self.filter_words_min:
+                    n_filtered_words += 1
+                    continue
+                if self.filter_words_max is not None and w > self.filter_words_max:
+                    n_filtered_words += 1
+                    continue
 
-            try:
-                with open(pkls[0], 'rb') as f:
-                    pickle.load(f)
-            except Exception:
-                n_corrupt += 1
-                continue
+                pkls = sorted([
+                    os.path.join(pose_dir, f)
+                    for f in os.listdir(pose_dir)
+                    if f.endswith(".pkl")
+                ])
+                if len(pkls) < self.min_frames:
+                    n_short += 1
+                    continue
 
-            self.data_list.append((stext, pkls))
+                self.data_list.append((stext, pkls))
 
-        lengths  = np.array([len(d[1]) for d in self.data_list])
-        n_pad    = (lengths <= self.target_seq_len).sum()
-        n_sample = (lengths >  self.target_seq_len).sum()
+        # Length stats only meaningful in legacy pkl path (where source is a
+        # list of frame-pkls). In aggregated mode, T lives inside the .npz so
+        # we skip this stat to avoid 30k file opens.
+        msg_src = 'npz' if self.use_aggregated else 'pkls'
+        filt_msg = ''
+        if self.filter_words_min is not None or self.filter_words_max is not None:
+            filt_msg = f", filt_words={n_filtered_words} (range={self.filter_words_min}-{self.filter_words_max})"
+        if self.use_aggregated:
+            stat_msg = f"[{self.mode}] {len(self.data_list)} samples (src={msg_src}, missing={n_missing}{filt_msg})"
+        else:
+            lengths  = np.array([len(d[1]) for d in self.data_list])
+            n_pad    = (lengths <= self.target_seq_len).sum()
+            n_sample = (lengths >  self.target_seq_len).sum()
+            stat_msg = (f"[{self.mode}] {len(self.data_list)} samples (src={msg_src}, "
+                        f"missing={n_missing}, short={n_short}, corrupt={n_corrupt}, "
+                        f"pad={n_pad}, uniform_sample={n_sample})")
 
         if self.logger is not None:
-            self.logger.info(f"[{self.mode}] {len(self.data_list)} samples "
-                             f"(missing={n_missing}, short={n_short}, corrupt={n_corrupt})")
-            self.logger.info(f"[{self.mode}] pad={n_pad}, uniform_sample={n_sample}")
+            self.logger.info(stat_msg)
         else:
-            print(f"[{self.mode}] {len(self.data_list)} samples "
-                  f"(missing={n_missing}, short<{self.min_frames}={n_short}, corrupt={n_corrupt})")
-            print(f"[{self.mode}] pad(T<={self.target_seq_len})={n_pad}, "
-                  f"uniform_sample(T>{self.target_seq_len})={n_sample}")
+            print(stat_msg)
+
+    # ==================== In-memory preload ====================
+
+    def _preload_all_pkls(self):
+        """
+        Load every per-frame pkl into RAM up-front via a process pool so
+        __getitem__ can skip disk IO. The cache lives in the main process;
+        DataLoader workers inherit it cheaply via fork (copy-on-write).
+
+        Memory footprint at ~150 frames/sample × 53 × 3 × 4 bytes ≈ 95KB/sample;
+        22k samples ≈ 2GB total.
+        """
+        self.pose_cache = [None] * len(self.data_list)
+        self.expr_cache = [None] * len(self.data_list)
+
+        n_workers = max(1, getattr(self.cfg, 'PRELOAD_WORKERS', 8))
+        tasks = [(i, pkls) for i, (_, pkls) in enumerate(self.data_list)]
+
+        msg = f"[{self.mode}] preloading {len(tasks)} samples with {n_workers} workers..."
+        if self.logger is not None:
+            self.logger.info(msg)
+        else:
+            print(msg)
+
+        n_ok = n_bad = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_load_one_sample, t) for t in tasks]
+            pbar = tqdm(as_completed(futures),
+                        total=len(futures),
+                        desc=f"[{self.mode}] preload pkls",
+                        ncols=100)
+            for fut in pbar:
+                idx, pose, expr, err = fut.result()
+                if err is None:
+                    self.pose_cache[idx] = pose
+                    self.expr_cache[idx] = expr
+                    n_ok += 1
+                else:
+                    n_bad += 1
+                    if self.logger is not None:
+                        self.logger.info(f"[preload] idx={idx} failed: {err}")
+
+        # Drop entries that failed to load so __getitem__ never returns garbage
+        if n_bad > 0:
+            keep = [i for i, p in enumerate(self.pose_cache) if p is not None]
+            self.data_list  = [self.data_list[i]  for i in keep]
+            self.pose_cache = [self.pose_cache[i] for i in keep]
+            self.expr_cache = [self.expr_cache[i] for i in keep]
+
+        n_bytes = sum(p.nbytes + e.nbytes
+                      for p, e in zip(self.pose_cache, self.expr_cache))
+        msg = (f"[{self.mode}] preload done: ok={n_ok}, bad={n_bad}, "
+               f"~{n_bytes / 1e9:.2f} GB in RAM, "
+               f"{len(self.data_list)} samples retained")
+        if self.logger is not None:
+            self.logger.info(msg)
+        else:
+            print(msg)
 
     # ==================== Frame Loading ====================
 
@@ -270,34 +463,109 @@ class How2SignSMPLXDataset(Dataset):
     def __len__(self):
         return len(self.data_list)
 
+    # `self._bad_indices` is initialised in __init__ (instance-level — train
+    # and val dataset instances must NOT share this set).
+
+    def _load_one(self, idx):
+        """Load + process a single sample. Raises on failure.
+
+        Returns (seq, sentence, actual_len, gt_joints44).
+        gt_joints44 is a (target_seq_len, 44, 3) tensor when self.use_fk_cache,
+        else None.
+        """
+        sentence, source = self.data_list[idx]
+
+        cached_pose = (self.pose_cache[idx]
+                       if self.pose_cache is not None else None)
+        if cached_pose is not None:
+            total_len = cached_pose.shape[0]
+            indices   = self._sample_indices(total_len)
+            pose      = cached_pose[indices]
+            expr      = self.expr_cache[idx][indices]
+        elif isinstance(source, str) and source.endswith('.npz'):
+            d = np.load(source)
+            full_pose = d['axis_angle']
+            full_expr = d['expression']
+            indices = self._sample_indices(full_pose.shape[0])
+            pose = full_pose[indices].astype(np.float32)
+            expr = full_expr[indices].astype(np.float32)
+        else:
+            indices       = self._sample_indices(len(source))
+            selected_pkls = [source[i] for i in indices]
+            pose, expr    = self._load_pose_from_pkls(selected_pkls)
+
+        seq = self._process_sequence(pose, expr if self.use_expression else None)
+
+        # Reject NaN/Inf upstream of the network so loss can never go non-finite.
+        if not torch.isfinite(seq).all():
+            raise ValueError(f"non-finite values after _process_sequence (idx={idx})")
+
+        actual_len = seq.shape[0]
+        if actual_len < self.target_seq_len:
+            pad = torch.zeros(self.target_seq_len - actual_len, seq.shape[-1])
+            seq = torch.cat([seq, pad], dim=0)
+
+        gt_joints44 = None
+        if self.use_fk_cache:
+            if isinstance(source, str) and source.endswith('.npz'):
+                sname = os.path.splitext(os.path.basename(source))[0]
+            else:
+                # legacy pkl mode: source is a list of per-frame paths under
+                # {root}/{mode}_poses/poses/{sname}/...
+                sname = os.path.basename(os.path.dirname(source[0]))
+            fk_path = os.path.join(self.fk_joints_dir, f'{sname}.npz')
+            d_fk = np.load(fk_path)
+            full_joints = d_fk['joints44']  # (T_full, 44, 3) float32
+            sliced = full_joints[indices].astype(np.float32)  # (actual_len, 44, 3)
+            gt_joints44 = torch.from_numpy(sliced)
+            if gt_joints44.shape[0] < self.target_seq_len:
+                pad_j = torch.zeros(
+                    self.target_seq_len - gt_joints44.shape[0], 44, 3,
+                    dtype=gt_joints44.dtype,
+                )
+                gt_joints44 = torch.cat([gt_joints44, pad_j], dim=0)
+
+        return seq, sentence, actual_len, gt_joints44
+
     def __getitem__(self, idx):
-        try:
-            sentence, pkl_paths = self.data_list[idx]
+        # Fast path: try the requested index. If it fails (corrupt pkl / NaN /
+        # whatever), blacklist it and fall through to a deterministic safe
+        # neighbour rather than returning zeros — zeros + actual_len=0 cause
+        # downstream NaN loss when an entire micro-batch happens to be invalid.
+        original_idx = idx
+        if idx in self._bad_indices:
+            idx = self._safe_neighbour(idx)
 
-            # Select frame indices
-            indices       = self._sample_indices(len(pkl_paths))
-            selected_pkls = [pkl_paths[i] for i in indices]
+        for attempt in range(8):
+            try:
+                seq, sentence, actual_len, gt_joints44 = self._load_one(idx)
+                if self.use_fk_cache:
+                    return seq, sentence, sentence, actual_len, gt_joints44
+                return seq, sentence, sentence, actual_len
+            except Exception as e:
+                self._bad_indices.add(idx)
+                if self.logger is not None and attempt == 0:
+                    self.logger.info(
+                        f"[__getitem__] idx={idx} failed: {e} -> using neighbour"
+                    )
+                idx = self._safe_neighbour(idx)
 
-            # Load → pose (T, 53, 3) + expr (T, 10)
-            pose, expr = self._load_pose_from_pkls(selected_pkls)
+        # Should never reach here; if it does, surface the problem loudly.
+        raise RuntimeError(
+            f"__getitem__ failed 8× starting from idx={original_idx}. "
+            f"Bad-index set has {len(self._bad_indices)} entries."
+        )
 
-            # Process: joint selection, rot6d, root-norm, flatten → (T, input_dim)
-            seq = self._process_sequence(pose, expr if self.use_expression else None)
-            actual_len = seq.shape[0]
-
-            # Pad with zeros if shorter than target
-            if actual_len < self.target_seq_len:
-                pad = torch.zeros(self.target_seq_len - actual_len, seq.shape[-1])
-                seq = torch.cat([seq, pad], dim=0)
-
-            return seq, sentence, sentence, actual_len
-
-        except Exception as e:
-            if self.logger is not None:
-                self.logger.info(f"[ERROR] __getitem__ idx={idx}, error={e}")
-            import traceback
-            traceback.print_exc()
-            return torch.zeros(self.target_seq_len, self.input_dim), "", "", 0
+    def _safe_neighbour(self, idx):
+        """Pick a deterministic non-blacklisted index near idx."""
+        N = len(self.data_list)
+        for delta in range(1, N):
+            for cand in (idx + delta, idx - delta):
+                cand %= N
+                if cand not in self._bad_indices:
+                    return cand
+        # Everything blacklisted — give up.
+        return idx
 
 
     # ==================== Inverse Conversion (for generation / visualization) ====================

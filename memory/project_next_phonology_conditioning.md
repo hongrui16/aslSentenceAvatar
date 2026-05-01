@@ -1,29 +1,48 @@
 ---
-name: Next step — add phonology attributes from ASL-SignBank
-description: After current ablation runs finish, add SignBank phonology attributes (handshape/location/movement) as additional conditioning to the votingfusion pipeline.
+name: Planned additions for NeurIPS submission (4 items)
+description: Four planned additions to strengthen the paper — (1) phonology attributes, (2) Phoenix14T dataset, (3) alignment quantitative eval, (4) more SLP baselines
 type: project
 ---
 
-User stated (2026-04-18): after all current experiments complete (rule-based cfg, LLM-draft cfg, voting, votingfusion), the next step is to incorporate ASL-SignBank phonology attributes into the pipeline.
+User confirmed (2026-04-18) that all four additions below are planned and necessary for NeurIPS submission.
 
-## What this means
+## 1. Phonological attribute conditioning (highest priority)
 
-ASL-SignBank provides per-gloss phonological annotations: handshape, location, selected fingers, flexion, movement type, etc. These can serve as structured conditioning beyond the raw gloss text.
+Add ASL-SignBank phonology attributes (handshape, location, movement, selected fingers, flexion) as structured conditioning on top of voting+fusion.
 
-## Open design questions (not yet discussed)
+This creates a three-layer contribution: gloss selection → temporal reordering → phonological conditioning.
 
-1. How to map How2Sign sentence glosses to SignBank entries (gloss string matching? fuzzy matching?)
-2. Which attributes to use (handshape alone? full phonology vector?)
-3. Where to inject: as extra features concatenated to gloss embeddings before voting? As a separate conditioning branch? As part of cross-attention keys?
-4. How to handle glosses not found in SignBank (fallback to text-only?)
-5. Relationship to Paper 1 (ASL-SignBank-3D attribute classifiers) — can Paper 1's trained classifiers provide phonology embeddings?
+**Open design questions:**
+1. How to map How2Sign glosses to SignBank entries (string match? fuzzy?)
+2. Which attributes to use
+3. Where to inject: concatenate to gloss embeddings before voting? Separate branch? Part of cross-attention keys?
+4. How to handle glosses not in SignBank (fallback?)
+5. Can Paper 1's attribute classifiers provide phonology embeddings?
 
-## Connection to existing work
+**Existing hooks:** `--use_phono_attribute` flag in config.py
 
-- `--use_phono_attribute` flag already exists in `train_NeuralSignActors.py` and `config.py` (wired but not yet used in the voting/votingfusion pipeline)
-- Paper 1 trains attribute classifiers on SignBank data → could produce phonology embeddings for Paper 2
-- This would be the phonological conditioning angle mentioned in [Paper Plan](project_paper_plan.md)
+## 2. Second dataset — Phoenix14T
 
-**Why:** User's goal is a top-venue paper. Adding linguistically-grounded phonology conditioning on top of the voting+fusion architecture would strengthen the contribution beyond just "LLM draft + gate + cross-attention."
+Add Phoenix-2014T (German Sign Language) to demonstrate cross-language generalization.
+- Different sign language (DGS vs ASL)
+- Well-established benchmark in SLT literature
+- PGG-SLT reports results on Phoenix14T, so direct comparison possible
 
-**How to apply:** Wait for current runs to finish and analyze results first. Then discuss phonology integration design with user.
+## 3. Cross-attention alignment quantitative analysis
+
+Go beyond attention visualization — measure alignment quality quantitatively.
+- Compare learned attention patterns against GT gloss timing (if available) or pseudo-GT from forced alignment
+- Compute alignment accuracy / correlation metric
+- Show that cross-attention genuinely learns reordering, not just uniform attention
+
+## 4. More SLP baselines
+
+Compare against established sign language production methods:
+- SignAvatar (CVAE, already compared in hong2026phonologyguided)
+- Progressive Transformers (Saunders et al., 2020)
+- T2S-GPT (Xie et al., 2024)
+- SignDiff (Fang et al., 2023)
+
+**Why:** User confirmed these four additions are needed for NeurIPS-level contribution. Without them, the paper is "borderline" — with them, the method story (3-layer contribution) and experimental coverage (2 datasets, multiple baselines, quantitative alignment eval) are sufficient.
+
+**How to apply:** Prioritize (1) phonology attributes first (biggest impact on contribution). (2) and (4) can be parallelized. (3) can be done after votingfusion training completes.

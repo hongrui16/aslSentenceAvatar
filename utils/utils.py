@@ -101,8 +101,15 @@ def backup_code(
 
 def collate_fn(batch):
     """
-    How2SignSMPLXDataset 返回 4-tuple: (seq, sentence, sentence, actual_len)
+    How2SignSMPLXDataset 默认返回 4-tuple: (seq, sentence, sentence, actual_len)
+    USE_FK_JOINTS_CACHE 启用时返回 5-tuple, 末尾追加 gt_joints44: (T, 44, 3).
     """
+    if len(batch[0]) == 5:
+        seqs, sentence, conds2, lengths, gt_joints = zip(*batch)
+        seqs = torch.stack(seqs, dim=0)                    # (B, T, D)
+        gt_joints = torch.stack(gt_joints, dim=0)          # (B, T, 44, 3)
+        lengths = torch.tensor(lengths, dtype=torch.long)  # (B,)
+        return seqs, list(sentence), list(conds2), lengths, gt_joints
     seqs, sentence, conds2, lengths = zip(*batch)
     seqs = torch.stack(seqs, dim=0)                    # (B, T, D)
     lengths = torch.tensor(lengths, dtype=torch.long)  # (B,)

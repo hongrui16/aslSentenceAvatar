@@ -31,12 +31,14 @@ from accelerate.logging import get_logger
 
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
 from dataloader.How2SignSMPLXPhonoDataset import How2SignSMPLXPhonoDataset
+from dataloader.How2SignSMPLXVotingDataset import How2SignSMPLXVotingDataset
+from dataloader.Phoenix2DDataset import Phoenix2DDataset
 
 from network.MotionDiffusionModelV1_cfg import MotionDiffusionModelV1_CFG
 from network.MotionDiffusionModelV2_cfg import MotionDiffusionModelV2_CFG
 
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
-from config import How2Sign_SMPLX_Config
+from config import How2Sign_SMPLX_Config, Phoenix2D_Config
 from utils.rotation_conversion import get_joint_slices
 
 
@@ -48,7 +50,10 @@ class DiffusionTrainer:
         self.args = args
         self.debug = args.debug
 
-        Config = How2Sign_SMPLX_Config
+        if args.dataset == "Phoenix2D":
+            Config = Phoenix2D_Config
+        else:
+            Config = How2Sign_SMPLX_Config
 
         self.cfg = Config()
         self.cfg.DATASET_NAME = args.dataset
@@ -66,6 +71,15 @@ class DiffusionTrainer:
         self.cfg.N_FEATS = 6 if self.cfg.USE_ROT6D else 3
 
         self.cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
+        if args.text_encoder_type == 'mclip':
+            self.cfg.MCLIP_MODEL_NAME = args.mclip_model_name
+        self.cfg.MODEL_ARCH = args.model_arch
+        if args.target_seq_len is not None:
+            self.cfg.TARGET_SEQ_LEN = args.target_seq_len
+        if args.filter_words_min is not None:
+            self.cfg.FILTER_WORDS_MIN = args.filter_words_min
+        if args.filter_words_max is not None:
+            self.cfg.FILTER_WORDS_MAX = args.filter_words_max
 
         self.cfg.MODEL_VERSION = args.model_version
 
@@ -74,6 +88,31 @@ class DiffusionTrainer:
         self.cfg.UNCOND_PROB = args.uncond_prob
         self.cfg.GUIDANCE_SCALE = args.guidance_scale
         self.cfg.COND_MODE = args.cond_mode
+        self.cfg.GLOSS_SOURCE = args.gloss_source
+        self.cfg.GLOSS_ENCODING = args.gloss_encoding
+        self.cfg.USE_PHONO = args.use_phono
+        self.cfg.PHONO_DIM = args.phono_dim
+
+        # Per-group reconstruction weights (override hardcoded 0.5/5/5)
+        self.cfg.W_TORSO = args.w_torso
+        self.cfg.W_ARMS  = args.w_arms
+        self.cfg.W_HAND  = args.w_hand
+
+        # MDM-style geometric loss config (FK 3D joint position MSE).
+        self.cfg.USE_UNIFORM_POSE_LOSS = args.use_uniform_pose_loss
+        self.cfg.USE_FK_LOSS = args.use_fk_loss
+        self.cfg.FK_LOSS_WEIGHT = args.fk_loss_weight
+        self.cfg.CONTRASTIVE_WEIGHT = args.contrastive_weight
+        self.cfg.CONTRASTIVE_TAU = args.contrastive_tau
+        self.cfg.REGRESSION_MODE = args.regression_mode
+        # Capacity scaling overrides
+        if args.latent_dim is not None: self.cfg.LATENT_DIM = args.latent_dim
+        if args.model_dim is not None:  self.cfg.MODEL_DIM  = args.model_dim
+        if args.n_heads is not None:    self.cfg.N_HEADS    = args.n_heads
+        if args.n_layers is not None:   self.cfg.N_LAYERS   = args.n_layers
+        self.cfg.USE_FK_JOINTS_CACHE = bool(
+            self.cfg.USE_FK_LOSS and self.cfg.DATASET_NAME != "Phoenix2D"
+        )
 
         if args.batch_size:
             self.cfg.TRAIN_BSZ = args.batch_size
@@ -90,14 +129,20 @@ class DiffusionTrainer:
         if self.debug:
             timestamp = "debug_" + timestamp
 
+        if self.cfg.GLOSS_SOURCE == 'llm_draft':
+            cfg_suffix = "cfg_llm"
+        elif self.cfg.GLOSS_SOURCE == 'gt':
+            cfg_suffix = "cfg_gtgloss"
+        else:
+            cfg_suffix = "cfg"
         self.logging_dir = os.path.join(
-            self.cfg.LOG_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}_cfg", self.cfg.DATASET_NAME, timestamp
+            self.cfg.LOG_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}_{cfg_suffix}", self.cfg.DATASET_NAME, timestamp
         )
         if self.debug:
             self.ckpt_dir = self.logging_dir
         else:
             self.ckpt_dir = os.path.join(
-                self.cfg.CKPT_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}_cfg", self.cfg.DATASET_NAME, timestamp
+                self.cfg.CKPT_DIR, f"{self.cfg.PROJECT_NAME}_{self.cfg.MODEL_VERSION}_{cfg_suffix}", self.cfg.DATASET_NAME, timestamp
             )
 
         # ---- Accelerator ----
@@ -125,6 +170,7 @@ class DiffusionTrainer:
 
         self.global_step = 0
         self.best_loss = float('inf')
+        self.second_best_loss = float('inf')
         self.start_epoch = 0
 
         if args.resume:
@@ -156,14 +202,22 @@ class DiffusionTrainer:
     def _build_components(self):
         self.logger.info("Building components...")
 
-        # Use PhonoDataset when gloss condition is needed (provides pseudo-gloss strings)
         use_gloss = self.cfg.COND_MODE in ('gloss', 'sentence_gloss')
-        DatasetCls = How2SignSMPLXPhonoDataset if use_gloss else How2SignSMPLXDataset
 
-        if self.cfg.DATASET_NAME == "How2SignSMPLX":
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            DatasetCls = Phoenix2DDataset
+            train_dataset = DatasetCls(mode='train', cfg=self.cfg, logger=self.logger)
+            test_dataset  = DatasetCls(mode='dev',   cfg=self.cfg, logger=self.logger)
+        elif self.cfg.DATASET_NAME == "How2SignSMPLX":
+            if not use_gloss:
+                DatasetCls = How2SignSMPLXDataset
+            elif self.cfg.GLOSS_SOURCE == 'llm_draft':
+                DatasetCls = How2SignSMPLXVotingDataset
+            else:
+                DatasetCls = How2SignSMPLXPhonoDataset
             if self.cfg.DATASET_VERSION.lower() == 'v1':
                 train_dataset = DatasetCls(mode='train', cfg=self.cfg, logger=self.logger)
-                test_dataset = DatasetCls(mode='test', cfg=self.cfg, logger=self.logger)
+                test_dataset  = DatasetCls(mode='test',  cfg=self.cfg, logger=self.logger)
         else:
             raise ValueError(f"Unknown dataset: {self.cfg.DATASET_NAME}")
 
@@ -188,6 +242,9 @@ class DiffusionTrainer:
 
         # Store dataset info in config
         self.cfg.INPUT_DIM = train_dataset.input_dim
+        # Phoenix: sync body_k so the loss split matches what the dataset emits
+        if hasattr(train_dataset, 'body_k'):
+            self.cfg.PHOENIX_BODY_K = train_dataset.body_k
 
         # Model — use CFG variants
         self.logger.info(f"Building MotionDiffusionModel {self.cfg.MODEL_VERSION} (CFG)...")
@@ -220,8 +277,20 @@ class DiffusionTrainer:
         if self.test_loader is not None:
             self.test_loader = self.accelerator.prepare(self.test_loader)
 
+        # SMPL-X FK module for geometric loss (How2Sign SMPL-X path only).
+        self.smplx_fk = None
+        if (self.cfg.USE_FK_LOSS and self.cfg.DATASET_NAME != "Phoenix2D"):
+            # Lightweight kinematic-tree-only FK (~35× faster, 40× less mem).
+            from utils.smplx_fk_diff_fast import SMPLXForwardKinematicsFast as SMPLXForwardKinematics
+            self.logger.info(f"Building SMPL-X FK for geometric loss "
+                             f"(λ_fk={self.cfg.FK_LOSS_WEIGHT})...")
+            self.smplx_fk = SMPLXForwardKinematics().to(self.accelerator.device)
+            for p in self.smplx_fk.parameters():
+                p.requires_grad = False
+            self.smplx_fk.eval()
+
     # ================================================================== loss
-    def compute_loss(self, output, target, padding_mask):
+    def compute_loss(self, output, target, padding_mask, gt_joints44=None):
         """
         Diffusion loss with joint-group weighting.
 
@@ -236,6 +305,30 @@ class DiffusionTrainer:
             mask = valid_mask.unsqueeze(-1).expand_as(mse).float()
             return (mse * mask).sum() / (mask.sum() + 1e-8)
 
+        # Phoenix-2D: no SMPL-X joint slices. Body 33 + lhand 21 + rhand 21,
+        # 3 dims each. Hands are still upweighted (they carry the linguistic
+        # content), but slicing follows MediaPipe topology.
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            body_k = getattr(self.cfg, 'PHOENIX_BODY_K', 33)
+            hand_k = getattr(self.cfg, 'PHOENIX_HAND_K', 21)
+            body_end  = body_k * 3
+            lhand_end = body_end + hand_k * 3
+            rhand_end = lhand_end + hand_k * 3
+            # Phoenix has no torso/arms split — body_K bundles them. Map:
+            #   body  ← w_arms  (signing-driving joints dominate body group)
+            #   hand  ← w_hand  (same as SMPL-X)
+            w_body_phx = getattr(self.cfg, 'W_ARMS', 5.0)
+            w_hand_phx = getattr(self.cfg, 'W_HAND', 5.0)
+            mse_loss = (w_body_phx * masked_mse(output[..., :body_end],          target[..., :body_end])
+                      + w_hand_phx * masked_mse(output[..., body_end:lhand_end], target[..., body_end:lhand_end])
+                      + w_hand_phx * masked_mse(output[..., lhand_end:rhand_end], target[..., lhand_end:rhand_end]))
+            # Velocity loss removed.
+            vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+            total = mse_loss
+            # FK loss not applicable to Phoenix 2D — match SMPL-X path's 4-tuple.
+            fk_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+            return total, mse_loss, vel_loss, fk_loss
+
         joint_groups = get_joint_slices(n_feats=n_feats)
         ROOT       = joint_groups['ROOT']
         LOWER_BODY = joint_groups['LOWER_BODY']
@@ -245,41 +338,66 @@ class DiffusionTrainer:
         RHAND      = joint_groups['RHAND']
         JAW        = joint_groups['JAW']
 
+        w_torso = getattr(self.cfg, 'W_TORSO', 0.5)
+        w_arms  = getattr(self.cfg, 'W_ARMS',  5.0)
+        w_hand  = getattr(self.cfg, 'W_HAND',  5.0)
+
         # Weighted reconstruction (eps_pred vs noise, or x_0_pred vs x_0)
-        mse_loss = (0.5 * masked_mse(output[..., TORSO],  target[..., TORSO])
-                  + 0.0 * masked_mse(output[..., ROOT],  target[..., ROOT])
-                  + 0.0 * masked_mse(output[..., LOWER_BODY],  target[..., LOWER_BODY])
-                  + 5.0 * masked_mse(output[..., ARMS], target[..., ARMS])
-                  + 5.0 * masked_mse(output[..., LHAND], target[..., LHAND])
-                  + 5.0 * masked_mse(output[..., RHAND], target[..., RHAND])
-                  + 0.1 * masked_mse(output[..., JAW],   target[..., JAW]))
-
-        # Velocity loss — only meaningful for x_0 prediction. Under epsilon
-        # prediction the simple MSE on ε already constrains the x_0 statistics
-        # (including temporal structure), and recovering x_0_pred via 1/√ᾱ is
-        # numerically unstable at large t. Skip it entirely in epsilon mode.
-        if self.cfg.PREDICTION_TYPE == 'epsilon':
-            vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        if getattr(self.cfg, 'USE_UNIFORM_POSE_LOSS', False):
+            ACTIVE = TORSO + ARMS + LHAND + RHAND + JAW
+            mse_loss = masked_mse(output[..., ACTIVE], target[..., ACTIVE])
         else:
-            vel_gt   = target[:, 1:] - target[:, :-1]
-            vel_pred = output[:, 1:] - output[:, :-1]
-            vel_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
+            mse_loss = (w_torso * masked_mse(output[..., TORSO],  target[..., TORSO])
+                      + 0.0     * masked_mse(output[..., ROOT],  target[..., ROOT])
+                      + 0.0     * masked_mse(output[..., LOWER_BODY],  target[..., LOWER_BODY])
+                      + w_arms  * masked_mse(output[..., ARMS], target[..., ARMS])
+                      + w_hand  * masked_mse(output[..., LHAND], target[..., LHAND])
+                      + w_hand  * masked_mse(output[..., RHAND], target[..., RHAND])
+                      + 0.1     * masked_mse(output[..., JAW],   target[..., JAW]))
 
-            def masked_vel(pred, gt):
-                mse = F.mse_loss(pred, gt, reduction='none')
-                mask = vel_valid.unsqueeze(-1).expand_as(mse).float()
-                return (mse * mask).sum() / (mask.sum() + 1e-8)
+        # FK 3D joint position loss (only valid under x_0 prediction).
+        fk_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        if (getattr(self.cfg, 'USE_FK_LOSS', False)
+                and self.cfg.PREDICTION_TYPE == 'x0'
+                and self.smplx_fk is not None
+                and not self.cfg.USE_ROT6D):
+            joints3d_pred = self.smplx_fk(output)
+            if gt_joints44 is not None:
+                joints3d_gt = gt_joints44.to(joints3d_pred.device, joints3d_pred.dtype)
+            else:
+                with torch.no_grad():
+                    joints3d_gt = self.smplx_fk(target)      # GT frozen
+            mask4 = valid_mask.unsqueeze(-1).unsqueeze(-1).expand_as(joints3d_pred).float()
+            sq = (joints3d_pred - joints3d_gt) ** 2
+            fk_loss = (sq * mask4).sum() / (mask4.sum() + 1e-8)
 
-            vel_loss = (0.5 * masked_vel(vel_pred[..., TORSO],  vel_gt[..., TORSO])
-                      + 0.0 * masked_vel(vel_pred[..., ROOT],  vel_gt[..., ROOT])
-                      + 0.0 * masked_vel(vel_pred[..., LOWER_BODY],  vel_gt[..., LOWER_BODY])
-                      + 5.0 * masked_vel(vel_pred[..., ARMS],  vel_gt[..., ARMS])
-                      + 5.0 * masked_vel(vel_pred[..., LHAND], vel_gt[..., LHAND])
-                      + 5.0 * masked_vel(vel_pred[..., RHAND], vel_gt[..., RHAND])
-                      + 0.1 * masked_vel(vel_pred[..., JAW],   vel_gt[..., JAW]))
+        # Velocity loss removed entirely.
+        vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
 
-        total = mse_loss + self.cfg.VEL_WEIGHT * vel_loss
-        return total, mse_loss, vel_loss
+        fk_w = float(getattr(self.cfg, 'FK_LOSS_WEIGHT', 0.0)) if getattr(self.cfg, 'USE_FK_LOSS', False) else 0.0
+
+        # ── InfoNCE contrastive loss on FK 3D positions ──────────────────────
+        # Mirrors the implementation in trainMotionDiffusion_voting.py.
+        contrast_w = float(getattr(self.cfg, 'CONTRASTIVE_WEIGHT', 0.0))
+        contrast_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        if contrast_w > 0 and getattr(self.cfg, 'USE_FK_LOSS', False) and self.smplx_fk is not None:
+            B, T = joints3d_pred.shape[:2]
+            if B > 1:
+                def _pool3(x):  # (B, T, 44, 3) → (B, 396)
+                    p1 = x[:, :T // 3].mean(1).flatten(1)
+                    p2 = x[:, T // 3:2 * T // 3].mean(1).flatten(1)
+                    p3 = x[:, 2 * T // 3:].mean(1).flatten(1)
+                    return torch.cat([p1, p2, p3], dim=-1)
+
+                gen_emb = F.normalize(_pool3(joints3d_pred), dim=-1)
+                gt_emb  = F.normalize(_pool3(joints3d_gt),   dim=-1)
+                tau = float(getattr(self.cfg, 'CONTRASTIVE_TAU', 0.1))
+                sim = gen_emb @ gt_emb.T / tau
+                labels = torch.arange(B, device=sim.device)
+                contrast_loss = F.cross_entropy(sim, labels)
+
+        total = mse_loss + fk_w * fk_loss + contrast_w * contrast_loss
+        return total, mse_loss, vel_loss, fk_loss
 
     # ================================================================== train epoch
     def train_epoch(self, epoch):
@@ -289,6 +407,7 @@ class DiffusionTrainer:
         epoch_loss = 0.0
         epoch_mse = 0.0
         epoch_vel = 0.0
+        epoch_fk  = 0.0
         num_batches = 0
 
         num_prints = 50
@@ -303,28 +422,33 @@ class DiffusionTrainer:
                 progress_bar.update(1)
 
             with self.accelerator.accumulate(self.model):
-                motion, sentence, gloss_strings, actual_lengths = batch
+                if len(batch) == 5:
+                    motion, sentence, gloss_strings, actual_lengths, gt_joints44 = batch
+                else:
+                    motion, sentence, gloss_strings, actual_lengths = batch
+                    gt_joints44 = None
 
                 B, T, _ = motion.shape
                 lengths      = actual_lengths.to(motion.device)
                 padding_mask = create_padding_mask(lengths, T, self.device)
 
-                # ---- Diffusion training step ----
-                t = torch.randint(0, unwrapped.num_timesteps, (B,), device=motion.device)
-
-                noise = torch.randn_like(motion)
-                x_t = unwrapped.q_sample(motion, t, noise)
-
-                # Gloss input (None if cond_mode='sentence')
-                # Gloss input (None if cond_mode='sentence')
+                # ---- Diffusion or regression training step ----
                 gi = list(gloss_strings) if self.cfg.COND_MODE in ('gloss', 'sentence_gloss') else None
 
-                # Model forward (returns eps_pred or x_0_pred)
-                output = self.model(x_t, t, list(sentence), padding_mask, motion, gloss_input=gi)
+                if getattr(self.cfg, 'REGRESSION_MODE', False):
+                    # Bypass diffusion: feed zeros + t=0, model produces motion from cond.
+                    x_t = torch.zeros_like(motion)
+                    t = torch.zeros((B,), dtype=torch.long, device=motion.device)
+                    target = motion
+                else:
+                    t = torch.randint(0, unwrapped.num_timesteps, (B,), device=motion.device)
+                    noise = torch.randn_like(motion)
+                    x_t = unwrapped.q_sample(motion, t, noise)
+                    target = noise if self.cfg.PREDICTION_TYPE == 'epsilon' else motion
 
-                # Loss: target is noise for eps prediction, motion for x_0 prediction
-                target = noise if self.cfg.PREDICTION_TYPE == 'epsilon' else motion
-                loss, mse, vel = self.compute_loss(output, target, padding_mask)
+                output = self.model(x_t, t, list(sentence), padding_mask, motion, gloss_input=gi)
+                loss, mse, vel, fk = self.compute_loss(output, target, padding_mask,
+                                                       gt_joints44=gt_joints44)
 
                 # Backward
                 self.accelerator.backward(loss)
@@ -337,6 +461,7 @@ class DiffusionTrainer:
                 epoch_loss += loss.item()
                 epoch_mse += mse.item()
                 epoch_vel += vel.item()
+                epoch_fk  += fk.item()
                 num_batches += 1
                 self.global_step += 1
 
@@ -354,6 +479,7 @@ class DiffusionTrainer:
             'loss': epoch_loss / max(num_batches, 1),
             'mse': epoch_mse / max(num_batches, 1),
             'vel': epoch_vel / max(num_batches, 1),
+            'fk':  epoch_fk  / max(num_batches, 1),
         }
 
     # ================================================================== eval
@@ -365,11 +491,16 @@ class DiffusionTrainer:
         total_loss = 0.0
         total_mse = 0.0
         total_vel = 0.0
+        total_fk  = 0.0
         num_batches = 0
 
         for batch in tqdm(self.test_loader, desc="Evaluating",
                           disable=not self.accelerator.is_local_main_process):
-            motion, sentence, gloss_strings, actual_lengths = batch
+            if len(batch) == 5:
+                motion, sentence, gloss_strings, actual_lengths, gt_joints44 = batch
+            else:
+                motion, sentence, gloss_strings, actual_lengths = batch
+                gt_joints44 = None
 
             B, T, _ = motion.shape
             lengths      = actual_lengths.to(motion.device)
@@ -383,23 +514,26 @@ class DiffusionTrainer:
             output = self.model(x_t, t, list(sentence), padding_mask, motion, gloss_input=gi)
 
             target = noise if self.cfg.PREDICTION_TYPE == 'epsilon' else motion
-            loss, mse, vel = self.compute_loss(output, target, padding_mask)
+            loss, mse, vel, fk = self.compute_loss(output, target, padding_mask,
+                                                   gt_joints44=gt_joints44)
 
             total_loss += loss.item()
             total_mse += mse.item()
             total_vel += vel.item()
+            total_fk  += fk.item()
             num_batches += 1
 
         metrics = {
             'loss': total_loss / max(num_batches, 1),
             'mse': total_mse / max(num_batches, 1),
             'vel': total_vel / max(num_batches, 1),
+            'fk':  total_fk  / max(num_batches, 1),
         }
 
         if self.accelerator.is_main_process:
             self.logger.info(
                 f"Eval Epoch {epoch+1}: loss={metrics['loss']:.4f}, "
-                f"mse={metrics['mse']:.4f}, vel={metrics['vel']:.4f}"
+                f"mse={metrics['mse']:.4f}, vel={metrics['vel']:.4f}, fk={metrics['fk']:.4f}"
             )
         return metrics
 
@@ -416,17 +550,18 @@ class DiffusionTrainer:
         self.logger.info(f"  Uncond prob (CFG): {self.cfg.UNCOND_PROB}")
         self.logger.info(f"  Guidance scale: {self.cfg.GUIDANCE_SCALE}")
         self.logger.info(f"  Cond mode: {self.cfg.COND_MODE}")
+        self.logger.info(f"  Gloss source: {self.cfg.GLOSS_SOURCE}")
         self.logger.info("=" * 60)
 
-        train_hist = {'total': [], 'mse': [], 'vel': []}
-        eval_hist = {'total': [], 'mse': [], 'vel': []}
+        train_hist = {'total': [], 'mse': [], 'fk': []}
+        eval_hist = {'total': [], 'mse': [], 'fk': []}
 
         for epoch in range(self.start_epoch, self.cfg.MAX_EPOCHS):
             train_metrics = self.train_epoch(epoch)
 
             train_hist['total'].append(train_metrics['loss'])
             train_hist['mse'].append(train_metrics['mse'])
-            train_hist['vel'].append(train_metrics['vel'])
+            train_hist['fk'].append(train_metrics['fk'])
 
             if self.accelerator.is_main_process:
                 self.logger.info(
@@ -439,15 +574,12 @@ class DiffusionTrainer:
                 eval_metrics = self.evaluate(epoch)
                 eval_hist['total'].append(eval_metrics['loss'])
                 eval_hist['mse'].append(eval_metrics['mse'])
-                eval_hist['vel'].append(eval_metrics['vel'])
+                eval_hist['fk'].append(eval_metrics['fk'])
             else:
                 eval_metrics = train_metrics
                 eval_hist = None
 
-            is_best = eval_metrics['loss'] < self.best_loss
-            if is_best:
-                self.best_loss = eval_metrics['loss']
-            self.save_checkpoint(epoch, eval_metrics, is_best)
+            self.save_checkpoint(epoch, eval_metrics)
 
             # Plot curves
             if self.accelerator.is_main_process and train_hist['total']:
@@ -466,7 +598,7 @@ class DiffusionTrainer:
         self.accelerator.end_training()
 
     # ================================================================== checkpoint
-    def save_checkpoint(self, epoch, metrics=None, is_best=False):
+    def save_checkpoint(self, epoch, metrics=None):
         if not self.accelerator.is_main_process:
             return
 
@@ -487,14 +619,31 @@ class DiffusionTrainer:
             'best_loss': self.best_loss,
         }
 
+        # 1. newest_model.pt — always saved
         ckpt_path = os.path.join(self.ckpt_dir, "newest_model.pt")
         torch.save(checkpoint, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
 
-        if is_best:
+        # 2 & 3. best_model.pt + second_best_model.pt — top-2 best
+        cur_loss = metrics['loss'] if metrics else float('inf')
+        if cur_loss < self.best_loss:
+            # Demote current best → second best
+            second_path = os.path.join(self.ckpt_dir, "second_best_model.pt")
+            best_path_src = os.path.join(self.ckpt_dir, "best_model.pt")
+            if os.path.exists(best_path_src):
+                os.replace(best_path_src, second_path)
+                self.logger.info(f"Demoted previous best → {second_path}")
+            self.second_best_loss = self.best_loss
+            # Save new best
             best_path = os.path.join(self.ckpt_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model: {best_path}")
+            self.best_loss = cur_loss
+        elif cur_loss < self.second_best_loss:
+            self.second_best_loss = cur_loss
+            second_path = os.path.join(self.ckpt_dir, "second_best_model.pt")
+            torch.save(checkpoint, second_path)
+            self.logger.info(f"Saved second best model: {second_path}")
 
     def load_checkpoint(self, checkpoint_path, finetune=False):
         if not os.path.exists(checkpoint_path):
@@ -546,14 +695,25 @@ def parse_args():
     parser.add_argument("--finetune", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--dataset", type=str, default="How2SignSMPLX",
-                        choices=["How2SignSMPLX"])
+                        choices=["How2SignSMPLX", "Phoenix2D"])
     parser.add_argument("--no_upper_body", action="store_true", default=False,
                         help="Disable upper-body-only mode (default: use upper body)")
     parser.add_argument("--use_rot6d", action="store_true", default=False)
     parser.add_argument("--use_mini_dataset", action="store_true", default=False)
     parser.add_argument("--no_root_normalize", action="store_true", default=False)
     parser.add_argument("--use_phono_attribute", action="store_true", default=False)
-    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5"])
+    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5", "mclip"])
+    parser.add_argument("--model_arch", type=str, default='mdm',
+                        choices=['mdm', 'kin', 'vel', 'ms', 'badt', 'badt_g', 'badt_c', 'badt_cg'],
+                        help='Denoiser variant: mdm (default), kin (kinematic bias), vel (velocity head), ms (multi-scale).')
+    parser.add_argument("--mclip_model_name", type=str, default='xlm-roberta-base',
+                        help='HF model name for the multilingual encoder when --text_encoder_type=mclip.')
+    parser.add_argument("--target_seq_len", type=int, default=None,
+                        help='Override TARGET_SEQ_LEN (default: from cfg, e.g. H2S=200, Phoenix=160).')
+    parser.add_argument("--filter_words_min", type=int, default=None,
+                        help='Drop sentences with fewer than this many words.')
+    parser.add_argument("--filter_words_max", type=int, default=None,
+                        help='Drop sentences with more than this many words.')
     parser.add_argument("--model_version", type=str, default='v1', choices=["v1", "v2"])
     parser.add_argument("--prediction_type", type=str, default='epsilon', choices=["epsilon", "x0"],
                         help="Predict noise (epsilon) or clean motion (x0)")
@@ -564,6 +724,44 @@ def parse_args():
     parser.add_argument("--cond_mode", type=str, default='sentence',
                         choices=["sentence", "gloss", "sentence_gloss"],
                         help="Condition mode: sentence-only, pseudo-gloss-only, or both")
+    parser.add_argument("--gloss_source", type=str, default='rule',
+                        choices=["rule", "llm_draft", "gt", "translation",
+                                 "pseudo_rule"],
+                        help="Gloss source. How2Sign: rule|llm_draft. "
+                             "Phoenix: gt|translation|pseudo_rule|llm_draft.")
+    parser.add_argument("--gloss_encoding", type=str, default='per_word',
+                        choices=["per_word", "whole_str"],
+                        help="Gloss text encoding: per_word (default) splits "
+                             "into words and mean-pools their CLIP/T5 "
+                             "embeddings; whole_str encodes the joined "
+                             "gloss list as a single string.")
+    parser.add_argument("--use_phono", action="store_true",
+                        help="Enable phonological attribute conditioning (requires gloss cond_mode)")
+    parser.add_argument("--phono_dim", type=int, default=64)
+
+    # Per-group reconstruction loss weights (defaults preserve historical behavior).
+    # Hands have 30 joints × weight 5 = 150 contribution vs arms 6×5=30, torso 7×0.5=3.5,
+    # so hands carry ~82% of total loss with defaults — set --w_arms / --w_hand to rebalance.
+    # MDM-style geometric losses (require --prediction_type x0).
+    parser.add_argument("--use_uniform_pose_loss", action="store_true", default=False)
+    parser.add_argument("--use_fk_loss", action="store_true", default=False)
+    parser.add_argument("--fk_loss_weight", type=float, default=5.0)
+    parser.add_argument("--contrastive_weight", type=float, default=0.0,
+                        help="InfoNCE contrastive loss on FK 3D positions (0 = off).")
+    parser.add_argument("--contrastive_tau", type=float, default=0.1,
+                        help="Temperature for InfoNCE softmax.")
+    parser.add_argument("--regression_mode", action="store_true", default=False,
+                        help="Bypass diffusion: train as direct regression "
+                             "model(zeros, t=0, cond) -> motion.")
+    # Capacity scaling overrides (default = use config.py values)
+    parser.add_argument("--latent_dim", type=int, default=None)
+    parser.add_argument("--model_dim",  type=int, default=None)
+    parser.add_argument("--n_heads",    type=int, default=None)
+    parser.add_argument("--n_layers",   type=int, default=None)
+    parser.add_argument("--w_torso", type=float, default=0.5)
+    parser.add_argument("--w_arms",  type=float, default=5.0)
+    parser.add_argument("--w_hand",  type=float, default=5.0,
+                        help="Applied to both LHAND and RHAND")
 
     return parser.parse_args()
 

@@ -14,24 +14,27 @@ We trained three diffusion backbones and two conditioning modes for the paper's 
 
 | Backbone | What it does |
 |---|---|
-| **MDM** | Standard motion-diffusion-model transformer |
-| **kin** | MDM + a kinematic transformer block that processes joints along the SMPL-X skeleton tree before the main diffusion transformer |
-| **ms** | MDM + a multi-scale transformer block |
+| **MDM** | Standard motion-diffusion-model transformer encoder. |
+| **kin** | Standard transformer encoder with an added **per-layer learnable scalar bias over temporal relative offsets** (frame ↔ frame). Despite the historical name, this variant does **not** encode any skeleton / kinematic-tree structure — the only difference from MDM is the relative-position bias on the time axis. |
+| **ms** | Two-stream temporal pyramid: a full-resolution transformer (fine stream) summed with a half-resolution transformer (coarse stream, 2× avg-pool then upsampled back). Captures short-range articulation and longer-range phrase-level structure jointly. |
 
 Conditioning modes: `CFG sent` (full-sentence classifier-free guidance) and `Voting LLM/rule` (per-token gating over an LLM-generated pseudo-gloss).
 
-### 1.2 Paper main table (FID, n=2314 test sentences, T=100)
+### 1.2 Paper main table — published-looking headline numbers (n=2314 test sentences, T=100)
 
-| Backbone | Input | FID | FID_AE | JerkR |
-|---|---|---|---|---|
-| MDM | sent CFG  | 2.66 | 5.55  | 0.71 |
-| **kin** | **sent CFG** ⭐ | **2.36** | **2.96**  | 0.71 |
-| ms  | sent CFG  | 2.52 | 3.93  | 0.58 |
-| MDM | LLM VO    | 2.57 | 4.65  | 0.76 |
-| ms  | LLM VO    | 2.67 | 7.43  | 0.59 |
-| MDM | rule VO   | 2.89 | 2.80  | 0.63 |
+The original paper main table swept three backbones (MDM, kin, ms) over multiple conditioning modes (CFG sentence, VoteOnly with LLM / rule / phono gloss, VoteAlign cross-attention). Below is a representative slice of the 20-row diffusion table plus the only public reproducible baseline (PT-SMPL-X) for context. **kin · VoteOnly · LLM + phono** was the headline champion at **FID 1.94 / FID_AE 1.19** — a strong-looking number that motivated the paper's main claims.
 
-The previous "champion" in this codebase (kin · VoteOnly · LLM-gloss + phonology features) reached **FID 1.94 / FID_AE 1.19** on the same protocol — a strong-looking number that motivated the paper's main claims.
+| # | Backbone · Mode | Input | FID ↓ | FID_AE ↓ | JerkR → 1 | BLEU-4 ↑ | R@10 ↑ |
+|---|---|---|---|---|---|---|---|
+| 1 | **kin · VoteOnly** ⭐ | LLM + phono | **1.94** | **1.19** | 1.36 | 0.73 | 11.50 |
+| 2 | ms · CFG | sent | 1.97 | 1.39 | **1.07** | 0.62 | 11.80 |
+| 3 | kin · CFG | sent | 2.05 | **0.75** | 1.36 | **0.92** | 12.60 |
+| 4 | ms · VoteAlign | rule | 2.13 | 3.51 | 1.12 | **1.23** | 13.40 |
+| 5 | MDM · VoteOnly | LLM + phono | 2.09 | 4.99 | 1.42 | 1.10 | **13.50** |
+| 6 | MDM · CFG | sent (baseline) | 2.24 | 4.13 | 1.31 | 0.80 | 11.80 |
+| 7 | PT-SMPL-X (mode-collapse baseline) | sent | 3.30 | — | **0.02** ✗ | 0.50 | 10.90 |
+
+Across the full 20-row diffusion sweep, every configuration sat in the **FID 1.94 – 2.32** range — comfortably below the only published reproducible How2Sign sentence-level baseline (PT-SMPL-X at FID 3.30, which we also reproduced and which we observe to be a mode-collapse case via JerkR ≈ 0.02). On paper, this looks like a strong incremental result over the prior baseline. The rest of this report shows that those headline numbers do not survive a faithfulness check.
 
 ---
 
@@ -113,7 +116,7 @@ Side-by-side renders of the FK-retrained champion (kin · CFG · sent, FID 2.36 
 
 The arms now move with realistic amplitude and the hand shapes are anatomically valid — the FK joint position loss did its job. But the motion is **still unrelated** to the input sentence — the avatar performs some signing gesture in each case, just not the gesture that corresponds to the GT.
 
-### 3.2 FK retrain — full table (post-fix, paper-ready)
+### 3.2 FK retrain — full table (post-fix)
 
 | Backbone | Input | FID (full) | FID_AE | JerkR |
 |---|---|---|---|---|
@@ -124,7 +127,7 @@ The arms now move with realistic amplitude and the hand shapes are anatomically 
 | ms  | LLM VO    | 2.67 | 7.43  | 0.59 |
 | MDM | rule VO   | 2.89 | 2.80  | 0.63 |
 
-The FID numbers stayed comparable to the original paper main table — no regression — but visual inspection still showed *content unfaithful* generation. **Improving the loss did not fix the underlying problem.**
+Compared to the original paper main table (Section 1.2, range FID 1.94 – 2.32), the FK-retrained checkpoints are **modestly worse on FID** (range 2.36 – 2.89, +0.4 FID at the champion). Despite the FID regression, visual inspection (samples A–D above) shows the avatar now produces realistic-amplitude motion with anatomically valid hand shapes — qualitatively *better* than the OLD champion's dampened low-amplitude pose stream. This is the first hint that the OLD low FID was bought by *clustering near the marginal mean*, not by generating better signing motion. The diagnostic in Section 4 makes this precise. **Improving the loss did not fix the underlying problem of content unfaithfulness, but it did shift the model away from marginal-collapse.**
 
 We then ran 10 follow-up experiments designed to push further: a 4-way lever ablation (FK loss weight 15 vs InfoNCE contrastive loss), a 2-way diffusion-fork regression baseline, and 4-way capacity scaling (2× and 3× model size). **All 10 collapsed.** The FK loss + uniform pose regime (the table above) was already the local maximum within this architecture family.
 
@@ -268,7 +271,7 @@ We arrived at this through:
 3. A direct diagnostic ablation shows that, in the diffusion model, **changing the input sentence has less influence on the output than rolling a different noise seed does** (`inter / intra = 0.84`).
 4. A clean regression baseline trained from scratch — no noise, no diffusion — shows the same collapse, *more directly*: all 15 rendered samples produce the same frozen pose. Doubling the training data from 13K to 26K made the collapse worse (`pair_to_gt / random` went from 0.96 to 0.99).
 
-The signature is consistent with **conditional-mean collapse under MSE on 1-shot data**: with only one motion sample per sentence in How2Sign's 26K pairs, the loss-optimal solution is to ignore the sentence and predict the marginal-mean motion. No architectural variation we tried — diffusion vs regression, MDM vs kinematic vs multi-scale, 1× vs 3× capacity, sentence-CFG vs LLM-Voting, with vs without phonology features — broke this collapse.
+The signature is consistent with **conditional-mean collapse under MSE on 1-shot data**: with only one motion sample per sentence in How2Sign's 26K pairs, the loss-optimal solution is to ignore the sentence and predict the marginal-mean motion. No architectural variation we tried — diffusion vs regression, MDM vs `kin` (temporal relative-position bias) vs `ms` (multi-scale temporal pyramid), 1× vs 3× capacity, sentence-CFG vs LLM-Voting, with vs without phonology features — broke this collapse.
 
 ### What would actually help
 

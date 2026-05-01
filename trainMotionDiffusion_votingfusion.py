@@ -32,10 +32,12 @@ from accelerate.utils import ProjectConfiguration
 from accelerate.logging import get_logger
 
 from dataloader.How2SignSMPLXVotingDataset import How2SignSMPLXVotingDataset
+from dataloader.How2SignSMPLXPhonoDataset import How2SignSMPLXPhonoDataset
+from dataloader.Phoenix2DDataset import Phoenix2DDataset
 from network.MotionDiffusionModelV1_votingfusion import MotionDiffusionModelV1_VotingFusion
 
 from utils.utils import plot_training_curves, backup_code, collate_fn, create_padding_mask
-from config import How2Sign_SMPLX_Config
+from config import How2Sign_SMPLX_Config, Phoenix2D_Config
 from utils.rotation_conversion import get_joint_slices
 
 
@@ -45,13 +47,25 @@ class VotingFusionDiffusionTrainer:
         self.args = args
         self.debug = args.debug
 
-        self.cfg = How2Sign_SMPLX_Config()
+        if args.dataset == "Phoenix2D":
+            self.cfg = Phoenix2D_Config()
+        else:
+            self.cfg = How2Sign_SMPLX_Config()
         self.cfg.DATASET_NAME = args.dataset
         self.cfg.USE_UPPER_BODY = not args.no_upper_body
         self.cfg.USE_ROT6D = args.use_rot6d
         self.cfg.USE_MINI_DATASET = args.use_mini_dataset
         self.cfg.ROOT_NORMALIZE = not args.no_root_normalize
         self.cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
+        if args.text_encoder_type == 'mclip':
+            self.cfg.MCLIP_MODEL_NAME = args.mclip_model_name
+        self.cfg.MODEL_ARCH = args.model_arch
+        if args.target_seq_len is not None:
+            self.cfg.TARGET_SEQ_LEN = args.target_seq_len
+        if args.filter_words_min is not None:
+            self.cfg.FILTER_WORDS_MIN = args.filter_words_min
+        if args.filter_words_max is not None:
+            self.cfg.FILTER_WORDS_MAX = args.filter_words_max
         self.cfg.MODEL_VERSION = 'v1'
         self.cfg.N_FEATS = 6 if self.cfg.USE_ROT6D else 3
 
@@ -61,6 +75,7 @@ class VotingFusionDiffusionTrainer:
         self.cfg.UNCOND_PROB = args.uncond_prob
         self.cfg.GUIDANCE_SCALE = args.guidance_scale
         self.cfg.COND_MODE = 'votingfusion'
+        self.cfg.GLOSS_SOURCE = args.gloss_source
 
         # Voting module config
         self.cfg.VOTING_N_LAYERS = args.voting_n_layers
@@ -71,6 +86,21 @@ class VotingFusionDiffusionTrainer:
         # Fusion module config
         self.cfg.FUSION_N_LAYERS = args.fusion_n_layers
         self.cfg.FUSION_N_HEADS = args.fusion_n_heads
+        self.cfg.SENT_COND_MODE = args.sent_cond_mode
+        self.cfg.USE_PHONO = args.use_phono
+        self.cfg.PHONO_DIM = args.phono_dim
+
+        self.cfg.W_TORSO = args.w_torso
+        self.cfg.W_ARMS  = args.w_arms
+        self.cfg.W_HAND  = args.w_hand
+
+        # MDM-style geometric loss config (FK 3D joint position MSE).
+        self.cfg.USE_UNIFORM_POSE_LOSS = args.use_uniform_pose_loss
+        self.cfg.USE_FK_LOSS = args.use_fk_loss
+        self.cfg.FK_LOSS_WEIGHT = args.fk_loss_weight
+        self.cfg.USE_FK_JOINTS_CACHE = bool(
+            self.cfg.USE_FK_LOSS and self.cfg.DATASET_NAME != "Phoenix2D"
+        )
 
         if args.batch_size:
             self.cfg.TRAIN_BSZ = args.batch_size
@@ -99,6 +129,9 @@ class VotingFusionDiffusionTrainer:
                 self.cfg.DATASET_NAME, timestamp
             )
 
+        os.makedirs(self.logging_dir, exist_ok=True)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
         # ---- Accelerator ----
         project_config = ProjectConfiguration(
             project_dir=self.logging_dir,
@@ -123,14 +156,12 @@ class VotingFusionDiffusionTrainer:
         self.logger.info(f"Logging dir: {self.logging_dir}")
         self.logger.info(f"Checkpoint dir: {self.ckpt_dir}")
 
-        os.makedirs(self.logging_dir, exist_ok=True)
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-
         self._build_components()
 
         self.global_step = 0
         self.start_epoch = 0
         self.best_loss = float('inf')
+        self.second_best_loss = float('inf')
 
         if args.resume:
             self.load_checkpoint(args.resume, finetune=args.finetune)
@@ -138,8 +169,16 @@ class VotingFusionDiffusionTrainer:
     def _build_components(self):
         self.logger.info("Building components...")
 
-        train_dataset = How2SignSMPLXVotingDataset(mode='train', cfg=self.cfg, logger=self.logger)
-        test_dataset = How2SignSMPLXVotingDataset(mode='test', cfg=self.cfg, logger=self.logger)
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            DatasetCls = Phoenix2DDataset
+        elif self.cfg.GLOSS_SOURCE in ('llm_draft', 'llm_shuffled'):
+            DatasetCls = How2SignSMPLXVotingDataset
+        else:
+            DatasetCls = How2SignSMPLXPhonoDataset
+        train_dataset = DatasetCls(mode='train', cfg=self.cfg, logger=self.logger)
+        test_dataset = DatasetCls(mode='test', cfg=self.cfg, logger=self.logger)
+        if hasattr(train_dataset, 'body_k'):
+            self.cfg.PHOENIX_BODY_K = train_dataset.body_k
 
         if self.cfg.TRAIN_BSZ > len(train_dataset):
             self.cfg.TRAIN_BSZ = len(train_dataset) // 2
@@ -155,6 +194,8 @@ class VotingFusionDiffusionTrainer:
             test_dataset, batch_size=self.cfg.EVAL_BSZ, shuffle=False,
             collate_fn=collate_fn, num_workers=self.cfg.NUM_WORKERS, pin_memory=True,
         )
+
+        self.cfg.INPUT_DIM = train_dataset.input_dim
 
         self.logger.info("Building MotionDiffusionModelV1_VotingFusion...")
         self.model = MotionDiffusionModelV1_VotingFusion(self.cfg)
@@ -182,8 +223,23 @@ class VotingFusionDiffusionTrainer:
             self.test_loader, self.lr_scheduler,
         )
 
+        # SMPL-X FK module for geometric loss (How2Sign SMPL-X path only).
+        self.smplx_fk = None
+        if (self.cfg.USE_FK_LOSS and self.cfg.DATASET_NAME != "Phoenix2D"):
+            # Lightweight kinematic-tree-only FK (~35× faster, 40× less mem).
+            from utils.smplx_fk_diff_fast import SMPLXForwardKinematicsFast as SMPLXForwardKinematics
+            self.logger.info(f"Building SMPL-X FK for geometric loss "
+                             f"(λ_fk={self.cfg.FK_LOSS_WEIGHT})...")
+            self.smplx_fk = SMPLXForwardKinematics().to(self.accelerator.device)
+            for p in self.smplx_fk.parameters():
+                p.requires_grad = False
+            self.smplx_fk.eval()
+
         if self.accelerator.is_main_process:
-            backup_code(self.logging_dir)
+            src_dir = os.path.dirname(os.path.abspath(__file__))
+            dst_dir = os.path.join(self.logging_dir, 'code_backup')
+            os.makedirs(dst_dir, exist_ok=True)
+            backup_code(project_root=src_dir, backup_dir=dst_dir, logger=self.logger)
             self._log_config()
 
     def _log_config(self):
@@ -192,7 +248,35 @@ class VotingFusionDiffusionTrainer:
                 self.logger.info(f"  {key}: {getattr(self.cfg, key)}")
 
     # ================================================================== loss
-    def compute_loss(self, output, target, padding_mask):
+    def _compute_loss_phoenix(self, output, target, padding_mask):
+        """Phoenix-2D flat MediaPipe loss split. body←w_arms, hand←w_hand."""
+        valid_mask = ~padding_mask
+
+        def masked_mse(pred, gt):
+            mse = F.mse_loss(pred, gt, reduction='none')
+            mask = valid_mask.unsqueeze(-1).expand_as(mse).float()
+            return (mse * mask).sum() / (mask.sum() + 1e-8)
+
+        body_k = getattr(self.cfg, 'PHOENIX_BODY_K', 25)
+        hand_k = getattr(self.cfg, 'PHOENIX_HAND_K', 21)
+        body_end  = body_k * 3
+        lhand_end = body_end + hand_k * 3
+        rhand_end = lhand_end + hand_k * 3
+        w_body_phx = getattr(self.cfg, 'W_ARMS', 5.0)
+        w_hand_phx = getattr(self.cfg, 'W_HAND', 5.0)
+        mse_loss = (w_body_phx * masked_mse(output[..., :body_end],          target[..., :body_end])
+                  + w_hand_phx * masked_mse(output[..., body_end:lhand_end], target[..., body_end:lhand_end])
+                  + w_hand_phx * masked_mse(output[..., lhand_end:rhand_end], target[..., lhand_end:rhand_end]))
+        # Velocity loss removed (no value under epsilon; not used here).
+        vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        total = mse_loss
+        # FK loss not applicable to Phoenix 2D — return 4-tuple with fk=0 to match SMPL-X path.
+        fk_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        return total, mse_loss, vel_loss, fk_loss
+
+    def compute_loss(self, output, target, padding_mask, gt_joints44=None):
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            return self._compute_loss_phoenix(output, target, padding_mask)
         B, T, D = output.shape
         n_feats = self.cfg.N_FEATS
         valid_mask = ~padding_mask if padding_mask is not None else torch.ones(B, T, dtype=torch.bool, device=output.device)
@@ -211,36 +295,45 @@ class VotingFusionDiffusionTrainer:
         RHAND      = joint_groups['RHAND']
         JAW        = joint_groups['JAW']
 
-        mse_loss = (0.5 * masked_mse(output[..., TORSO],  target[..., TORSO])
-                  + 0.0 * masked_mse(output[..., ROOT],  target[..., ROOT])
-                  + 0.0 * masked_mse(output[..., LOWER_BODY],  target[..., LOWER_BODY])
-                  + 5.0 * masked_mse(output[..., ARMS], target[..., ARMS])
-                  + 5.0 * masked_mse(output[..., LHAND], target[..., LHAND])
-                  + 5.0 * masked_mse(output[..., RHAND], target[..., RHAND])
-                  + 0.1 * masked_mse(output[..., JAW],   target[..., JAW]))
+        w_torso = getattr(self.cfg, 'W_TORSO', 0.5)
+        w_arms  = getattr(self.cfg, 'W_ARMS',  5.0)
+        w_hand  = getattr(self.cfg, 'W_HAND',  5.0)
 
-        if self.cfg.PREDICTION_TYPE == 'epsilon':
-            vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        if getattr(self.cfg, 'USE_UNIFORM_POSE_LOSS', False):
+            ACTIVE = TORSO + ARMS + LHAND + RHAND + JAW
+            mse_loss = masked_mse(output[..., ACTIVE], target[..., ACTIVE])
         else:
-            vel_gt   = target[:, 1:] - target[:, :-1]
-            vel_pred = output[:, 1:] - output[:, :-1]
-            vel_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
+            mse_loss = (w_torso * masked_mse(output[..., TORSO],  target[..., TORSO])
+                      + 0.0     * masked_mse(output[..., ROOT],  target[..., ROOT])
+                      + 0.0     * masked_mse(output[..., LOWER_BODY],  target[..., LOWER_BODY])
+                      + w_arms  * masked_mse(output[..., ARMS], target[..., ARMS])
+                      + w_hand  * masked_mse(output[..., LHAND], target[..., LHAND])
+                      + w_hand  * masked_mse(output[..., RHAND], target[..., RHAND])
+                      + 0.1     * masked_mse(output[..., JAW],   target[..., JAW]))
 
-            def masked_vel(pred, gt):
-                mse = F.mse_loss(pred, gt, reduction='none')
-                mask = vel_valid.unsqueeze(-1).expand_as(mse).float()
-                return (mse * mask).sum() / (mask.sum() + 1e-8)
+        # FK 3D joint position loss (only valid under x_0 prediction).
+        fk_loss = torch.zeros((), device=output.device, dtype=output.dtype)
+        if (getattr(self.cfg, 'USE_FK_LOSS', False)
+                and self.cfg.PREDICTION_TYPE == 'x0'
+                and self.smplx_fk is not None
+                and not self.cfg.USE_ROT6D):
+            joints3d_pred = self.smplx_fk(output)            # (B, T, 44, 3)
+            if gt_joints44 is not None:
+                joints3d_gt = gt_joints44.to(joints3d_pred.device, joints3d_pred.dtype)
+            else:
+                with torch.no_grad():
+                    joints3d_gt = self.smplx_fk(target)      # (B, T, 44, 3) frozen
+            mask4 = valid_mask.unsqueeze(-1).unsqueeze(-1).expand_as(joints3d_pred).float()
+            sq = (joints3d_pred - joints3d_gt) ** 2
+            fk_loss = (sq * mask4).sum() / (mask4.sum() + 1e-8)
 
-            vel_loss = (0.5 * masked_vel(vel_pred[..., TORSO],  vel_gt[..., TORSO])
-                      + 0.0 * masked_vel(vel_pred[..., ROOT],  vel_gt[..., ROOT])
-                      + 0.0 * masked_vel(vel_pred[..., LOWER_BODY],  vel_gt[..., LOWER_BODY])
-                      + 5.0 * masked_vel(vel_pred[..., ARMS],  vel_gt[..., ARMS])
-                      + 5.0 * masked_vel(vel_pred[..., LHAND], vel_gt[..., LHAND])
-                      + 5.0 * masked_vel(vel_pred[..., RHAND], vel_gt[..., RHAND])
-                      + 0.1 * masked_vel(vel_pred[..., JAW],   vel_gt[..., JAW]))
+        # Velocity loss removed (no value under epsilon; FK loss covers temporal
+        # consistency under x_0).
+        vel_loss = torch.zeros((), device=output.device, dtype=output.dtype)
 
-        total = mse_loss + self.cfg.VEL_WEIGHT * vel_loss
-        return total, mse_loss, vel_loss
+        fk_w = float(getattr(self.cfg, 'FK_LOSS_WEIGHT', 0.0)) if getattr(self.cfg, 'USE_FK_LOSS', False) else 0.0
+        total = mse_loss + fk_w * fk_loss
+        return total, mse_loss, vel_loss, fk_loss
 
     # ================================================================== train epoch
     def train_epoch(self, epoch):
@@ -250,6 +343,7 @@ class VotingFusionDiffusionTrainer:
         epoch_loss = 0.0
         epoch_mse = 0.0
         epoch_vel = 0.0
+        epoch_fk  = 0.0
         num_batches = 0
 
         num_prints = 50
@@ -264,7 +358,11 @@ class VotingFusionDiffusionTrainer:
                 progress_bar.update(1)
 
             with self.accelerator.accumulate(self.model):
-                motion, sentence, gloss_strings, actual_lengths = batch
+                if len(batch) == 5:
+                    motion, sentence, gloss_strings, actual_lengths, gt_joints44 = batch
+                else:
+                    motion, sentence, gloss_strings, actual_lengths = batch
+                    gt_joints44 = None
 
                 B, T, _ = motion.shape
                 lengths      = actual_lengths.to(motion.device)
@@ -278,7 +376,8 @@ class VotingFusionDiffusionTrainer:
                                     gloss_input=list(gloss_strings))
 
                 target = noise if self.cfg.PREDICTION_TYPE == 'epsilon' else motion
-                loss, mse, vel = self.compute_loss(output, target, padding_mask)
+                loss, mse, vel, fk = self.compute_loss(output, target, padding_mask,
+                                                       gt_joints44=gt_joints44)
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
@@ -290,6 +389,7 @@ class VotingFusionDiffusionTrainer:
                 epoch_loss += loss.item()
                 epoch_mse += mse.item()
                 epoch_vel += vel.item()
+                epoch_fk  += fk.item()
                 num_batches += 1
                 self.global_step += 1
 
@@ -298,16 +398,6 @@ class VotingFusionDiffusionTrainer:
                     self.logger.info(
                         f"[epoch {epoch}] Peak GPU: {mem:.2f} GB (batch_size={self.cfg.TRAIN_BSZ})"
                     )
-                    if unwrapped._voting_gates is not None:
-                        gates = unwrapped._voting_gates
-                        mask = unwrapped._voting_word_mask
-                        valid_gates = gates[~mask]
-                        if valid_gates.numel() > 0:
-                            self.logger.info(
-                                f"  Gate stats: mean={valid_gates.mean():.3f}, "
-                                f"std={valid_gates.std():.3f}, "
-                                f"min={valid_gates.min():.3f}, max={valid_gates.max():.3f}"
-                            )
 
                 if self.debug and step >= 10:
                     break
@@ -317,6 +407,7 @@ class VotingFusionDiffusionTrainer:
             'loss': epoch_loss / max(num_batches, 1),
             'mse': epoch_mse / max(num_batches, 1),
             'vel': epoch_vel / max(num_batches, 1),
+            'fk':  epoch_fk  / max(num_batches, 1),
         }
 
     # ================================================================== eval
@@ -328,11 +419,16 @@ class VotingFusionDiffusionTrainer:
         total_loss = 0.0
         total_mse = 0.0
         total_vel = 0.0
+        total_fk  = 0.0
         num_batches = 0
 
         for batch in tqdm(self.test_loader, desc="Evaluating",
                           disable=not self.accelerator.is_local_main_process):
-            motion, sentence, gloss_strings, actual_lengths = batch
+            if len(batch) == 5:
+                motion, sentence, gloss_strings, actual_lengths, gt_joints44 = batch
+            else:
+                motion, sentence, gloss_strings, actual_lengths = batch
+                gt_joints44 = None
 
             B, T, _ = motion.shape
             lengths      = actual_lengths.to(motion.device)
@@ -346,23 +442,26 @@ class VotingFusionDiffusionTrainer:
                                 gloss_input=list(gloss_strings))
 
             target = noise if self.cfg.PREDICTION_TYPE == 'epsilon' else motion
-            loss, mse, vel = self.compute_loss(output, target, padding_mask)
+            loss, mse, vel, fk = self.compute_loss(output, target, padding_mask,
+                                                   gt_joints44=gt_joints44)
 
             total_loss += loss.item()
             total_mse += mse.item()
             total_vel += vel.item()
+            total_fk  += fk.item()
             num_batches += 1
 
         metrics = {
             'loss': total_loss / max(num_batches, 1),
             'mse': total_mse / max(num_batches, 1),
             'vel': total_vel / max(num_batches, 1),
+            'fk':  total_fk  / max(num_batches, 1),
         }
 
         if self.accelerator.is_main_process:
             self.logger.info(
                 f"Eval Epoch {epoch+1}: loss={metrics['loss']:.4f}, "
-                f"mse={metrics['mse']:.4f}, vel={metrics['vel']:.4f}"
+                f"mse={metrics['mse']:.4f}, vel={metrics['vel']:.4f}, fk={metrics['fk']:.4f}"
             )
         return metrics
 
@@ -377,17 +476,22 @@ class VotingFusionDiffusionTrainer:
         self.logger.info(f"  Uncond prob (CFG): {self.cfg.UNCOND_PROB}")
         self.logger.info(f"  Voting: {self.cfg.VOTING_N_LAYERS}L, {self.cfg.VOTING_N_HEADS}H")
         self.logger.info(f"  Fusion: {self.cfg.FUSION_N_LAYERS}L, {self.cfg.FUSION_N_HEADS}H")
+        self.logger.info(f"  Sent cond mode: {self.cfg.SENT_COND_MODE}")
+        self.logger.info(f"  Use phono: {self.cfg.USE_PHONO} (dim={self.cfg.PHONO_DIM})")
+        self.logger.info(f"  Gloss source: {self.cfg.GLOSS_SOURCE}")
+        self.logger.info(f"  Uniform pose loss: {getattr(self.cfg, 'USE_UNIFORM_POSE_LOSS', False)}")
+        self.logger.info(f"  FK loss: {getattr(self.cfg, 'USE_FK_LOSS', False)} (λ={getattr(self.cfg, 'FK_LOSS_WEIGHT', 0.0)})")
         self.logger.info("=" * 60)
 
-        train_hist = {'total': [], 'mse': [], 'vel': []}
-        eval_hist = {'total': [], 'mse': [], 'vel': []}
+        train_hist = {'total': [], 'mse': [], 'fk': []}
+        eval_hist = {'total': [], 'mse': [], 'fk': []}
 
         for epoch in range(self.start_epoch, self.cfg.MAX_EPOCHS):
             train_metrics = self.train_epoch(epoch)
 
             train_hist['total'].append(train_metrics['loss'])
             train_hist['mse'].append(train_metrics['mse'])
-            train_hist['vel'].append(train_metrics['vel'])
+            train_hist['fk'].append(train_metrics['fk'])
 
             if self.accelerator.is_main_process:
                 self.logger.info(
@@ -399,12 +503,9 @@ class VotingFusionDiffusionTrainer:
             eval_metrics = self.evaluate(epoch)
             eval_hist['total'].append(eval_metrics['loss'])
             eval_hist['mse'].append(eval_metrics['mse'])
-            eval_hist['vel'].append(eval_metrics['vel'])
+            eval_hist['fk'].append(eval_metrics['fk'])
 
-            is_best = eval_metrics['loss'] < self.best_loss
-            if is_best:
-                self.best_loss = eval_metrics['loss']
-            self.save_checkpoint(epoch, eval_metrics, is_best)
+            self.save_checkpoint(epoch, eval_metrics)
 
             if self.accelerator.is_main_process and train_hist['total']:
                 fig = os.path.join(self.logging_dir, 'training_curves.png')
@@ -422,7 +523,7 @@ class VotingFusionDiffusionTrainer:
         self.accelerator.end_training()
 
     # ================================================================== checkpoint
-    def save_checkpoint(self, epoch, metrics=None, is_best=False):
+    def save_checkpoint(self, epoch, metrics=None):
         if not self.accelerator.is_main_process:
             return
 
@@ -443,14 +544,31 @@ class VotingFusionDiffusionTrainer:
             'best_loss': self.best_loss,
         }
 
+        # 1. newest_model.pt — always saved
         ckpt_path = os.path.join(self.ckpt_dir, "newest_model.pt")
         torch.save(checkpoint, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
 
-        if is_best:
+        # 2 & 3. best_model.pt + second_best_model.pt — top-2 best
+        cur_loss = metrics['loss'] if metrics else float('inf')
+        if cur_loss < self.best_loss:
+            # Demote current best → second best
+            second_path = os.path.join(self.ckpt_dir, "second_best_model.pt")
+            best_path_src = os.path.join(self.ckpt_dir, "best_model.pt")
+            if os.path.exists(best_path_src):
+                os.replace(best_path_src, second_path)
+                self.logger.info(f"Demoted previous best → {second_path}")
+            self.second_best_loss = self.best_loss
+            self.best_loss = cur_loss
+            # Save new best
             best_path = os.path.join(self.ckpt_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model: {best_path}")
+        elif cur_loss < self.second_best_loss:
+            self.second_best_loss = cur_loss
+            second_path = os.path.join(self.ckpt_dir, "second_best_model.pt")
+            torch.save(checkpoint, second_path)
+            self.logger.info(f"Saved second best model: {second_path}")
 
     def load_checkpoint(self, checkpoint_path, finetune=False):
         if not os.path.exists(checkpoint_path):
@@ -500,12 +618,19 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--finetune", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
-    parser.add_argument("--dataset", type=str, default="How2SignSMPLX")
+    parser.add_argument("--dataset", type=str, default="How2SignSMPLX",
+                        choices=["How2SignSMPLX", "Phoenix2D"])
     parser.add_argument("--no_upper_body", action="store_true", default=False)
     parser.add_argument("--use_rot6d", action="store_true", default=False)
     parser.add_argument("--use_mini_dataset", action="store_true", default=False)
     parser.add_argument("--no_root_normalize", action="store_true", default=False)
-    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5"])
+    parser.add_argument("--text_encoder_type", type=str, default='clip', choices=["clip", "t5", "mclip"])
+    parser.add_argument("--model_arch", type=str, default='mdm',
+                        choices=['mdm', 'kin', 'vel', 'ms'])
+    parser.add_argument("--mclip_model_name", type=str, default='xlm-roberta-base')
+    parser.add_argument("--target_seq_len", type=int, default=None)
+    parser.add_argument("--filter_words_min", type=int, default=None)
+    parser.add_argument("--filter_words_max", type=int, default=None)
     parser.add_argument("--prediction_type", type=str, default='epsilon', choices=["epsilon", "x0"])
     parser.add_argument("--uncond_prob", type=float, default=0.1)
     parser.add_argument("--guidance_scale", type=float, default=3.0)
@@ -519,7 +644,22 @@ def parse_args():
     # Fusion module
     parser.add_argument("--fusion_n_layers", type=int, default=2)
     parser.add_argument("--fusion_n_heads", type=int, default=8)
-
+    parser.add_argument("--sent_cond_mode", type=str, default='none',
+                        choices=['none', 'prefix', 'kv_pool'])
+    parser.add_argument("--use_phono", action="store_true")
+    parser.add_argument("--phono_dim", type=int, default=64)
+    parser.add_argument("--w_torso", type=float, default=0.5)
+    parser.add_argument("--w_arms",  type=float, default=5.0)
+    parser.add_argument("--w_hand",  type=float, default=5.0)
+    # MDM-style geometric losses (require --prediction_type x0).
+    parser.add_argument("--use_uniform_pose_loss", action="store_true", default=False)
+    parser.add_argument("--use_fk_loss", action="store_true", default=False)
+    parser.add_argument("--fk_loss_weight", type=float, default=5.0)
+    parser.add_argument("--gloss_source", type=str, default='llm_draft',
+                        choices=['llm_draft', 'llm_shuffled', 'rule',
+                                 'gt', 'translation', 'pseudo_rule'],
+                        help="Gloss source. How2Sign: llm_draft|llm_shuffled|rule. "
+                             "Phoenix: gt|translation|pseudo_rule|llm_draft.")
     return parser.parse_args()
 
 

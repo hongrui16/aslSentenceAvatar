@@ -33,7 +33,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from network.MotionDiffusionModelV1 import MotionDiffusionModelV1
 from network.MotionDiffusionModelV2 import MotionDiffusionModelV2
+from network.NeuralSignActorsModel  import NeuralSignActorsModel
 from config import How2Sign_SMPLX_Config
+from utils.motion_ae_fid import load_motion_ae, encode_motion, smplx_aa_to_upper3d
+from utils.region_fid import (
+    region_slices_for_dataset, compute_region_fid,
+)
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
 from utils.rotation_conversion import postprocess_motion
 
@@ -109,11 +114,13 @@ def compute_dtw(seq_a, seq_b):
 
 def compute_mpjpe(pred_np, gt_np):
     """
-    Mean per-frame L2 distance between two sequences of equal length.
+    Mean per-frame L2 distance. Truncates both sequences to the shorter
+    length when they differ (NSA generates fixed seq_len, GT is variable).
     pred_np, gt_np: (T, D) numpy arrays
     Returns: float
     """
-    return float(np.linalg.norm(pred_np - gt_np, axis=-1).mean())
+    T = min(pred_np.shape[0], gt_np.shape[0])
+    return float(np.linalg.norm(pred_np[:T] - gt_np[:T], axis=-1).mean())
 
 
 def gt_params_to_flat(gt_params_list):
@@ -275,16 +282,47 @@ def generate_motion(model, sentence: str, seq_len: int, device: str, cfg):
 # GT loading from pkl files
 # =============================================================================
 
-def load_gt_params(pkl_paths, zero_root=True):
+def load_gt_params(source, seq_len=None, zero_root=True):
     """
-    Load GT SMPL-X params from per-frame pkl files.
+    Load GT SMPL-X params, optionally pre-sampled to seq_len.
+
+    Accepts either:
+      - list[str] of per-frame pkl paths (legacy slow path)
+      - str ending in '.npz' pointing to per-sentence aggregated file (~5-10x
+        faster: single mmap'd read instead of ~95 pickle loads)
 
     Args:
-        zero_root: if True, zero out smplx_root_pose (removes global
-                   rotation / sitting tilt so avatar stands upright)
+        seq_len  : if set, sample full sequence to seq_len uniformly.
+        zero_root: if True, zero out smplx_root_pose.
     """
+    # Aggregated npz fast path
+    if isinstance(source, str) and source.endswith('.npz'):
+        d = np.load(source)
+        aa = d['axis_angle'].astype(np.float32)   # (T, 53, 3)
+        T = aa.shape[0]
+        if seq_len is not None:
+            idxs = sample_gt_indices(T, seq_len)
+        else:
+            idxs = list(range(T))
+        frame_params = []
+        for t in idxs:
+            params = {
+                'smplx_root_pose':  np.zeros(3, dtype=np.float32) if zero_root
+                                    else aa[t, 0].copy(),
+                'smplx_body_pose':  aa[t, 1:22].reshape(63).copy(),
+                'smplx_lhand_pose': aa[t, 22:37].reshape(45).copy(),
+                'smplx_rhand_pose': aa[t, 37:52].reshape(45).copy(),
+                'smplx_jaw_pose':   aa[t, 52].copy(),
+            }
+            frame_params.append(params)
+        return frame_params
+
+    # Legacy per-frame pkl path
+    if seq_len is not None:
+        idxs   = sample_gt_indices(len(source), seq_len)
+        source = [source[i] for i in idxs]
     frame_params = []
-    for p in pkl_paths:
+    for p in source:
         with open(p, 'rb') as f:
             d = pickle.load(f)
         params = {
@@ -385,9 +423,7 @@ def process_one_sample(
 
     # ── 2. GT GIF ─────────────────────────────────────────────────────────────
     print(f"     Rendering GT...")
-    gt_indices  = sample_gt_indices(len(pkl_paths), seq_len)
-    selected    = [pkl_paths[i] for i in gt_indices]
-    gt_params   = load_gt_params(selected)
+    gt_params   = load_gt_params(pkl_paths, seq_len=seq_len)
     render_to_gif(gt_params, smpl_x,
                   os.path.join(save_dir, 'gt.gif'),
                   img_size=img_size, gif_fps=gif_fps,
@@ -429,11 +465,14 @@ def main(args):
     cfg.TARGET_SEQ_LEN  = args.target_seq_len
     cfg.MODEL_VERSION = args.model_version
     COMPUTE_METRICS = args.compute_metrics
-    
+
+    # Use aggregated npz fast path for GT loading (10× faster than pkl).
+    # `load_gt_params` auto-detects npz vs pkl from the source type.
+
     if not args.poses_root is None:
-        cfg.ROOT_DIR        = args.poses_root 
-    if not args.xlsx is None:            
-        cfg.XLSX_PATH       = args.xlsx 
+        cfg.ROOT_DIR        = args.poses_root
+    if not args.xlsx is None:
+        cfg.XLSX_PATH       = args.xlsx
     cfg.CAMERA          = 'rgb_front'
 
 
@@ -458,11 +497,30 @@ def main(args):
     cfg.INPUT_DIM = test_dataset.input_dim
 
     # ── model ─────────────────────────────────────────────────────────────────
-    print(f"Building MotionDiffusionModel: {cfg.MODEL_VERSION}..")
-    if cfg.MODEL_VERSION == 'v1':
-        model = MotionDiffusionModelV1(cfg)
-    elif cfg.MODEL_VERSION == 'v2':
-        model = MotionDiffusionModelV2(cfg)
+    if args.nsa:
+        print("Building NeuralSignActorsModel..")
+        # NSA needs its own architecture cfg keys; pull from ckpt cfg if present
+        ckpt_meta = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        ckpt_cfg  = ckpt_meta.get('config', {})
+        cfg.GNN_JOINT_DIM    = ckpt_cfg.get('GNN_JOINT_DIM', 128)
+        cfg.GNN_N_LAYERS     = ckpt_cfg.get('GNN_N_LAYERS', 4)
+        cfg.LSTM_HIDDEN      = ckpt_cfg.get('LSTM_HIDDEN', 512)
+        cfg.LSTM_N_LAYERS    = ckpt_cfg.get('LSTM_N_LAYERS', 4)
+        cfg.NUM_DIFFUSION_STEPS = ckpt_cfg.get('NUM_DIFFUSION_STEPS', 1000)
+        cfg.CLIP_MODEL_NAME  = ckpt_cfg.get('CLIP_MODEL_NAME',
+                                            'openai/clip-vit-large-patch14')
+        cfg.USE_EXPRESSION   = ckpt_cfg.get('USE_EXPRESSION', False)
+        cfg.N_EXPR           = ckpt_cfg.get('N_EXPR', 10)
+        cfg.EXCLUDE_JAW      = ckpt_cfg.get('EXCLUDE_JAW', False)
+        cfg.USE_3D_INPUT     = ckpt_cfg.get('USE_3D_INPUT', False)
+        del ckpt_meta
+        model = NeuralSignActorsModel(cfg)
+    else:
+        print(f"Building MotionDiffusionModel: {cfg.MODEL_VERSION}..")
+        if cfg.MODEL_VERSION == 'v1':
+            model = MotionDiffusionModelV1(cfg)
+        elif cfg.MODEL_VERSION == 'v2':
+            model = MotionDiffusionModelV2(cfg)
 
     model = load_model_weight(model, args.checkpoint, device)
 
@@ -474,9 +532,18 @@ def main(args):
     sample_indices = random.sample(range(len(test_dataset)), n_samples)
     print(f"\nSelected {n_samples} samples from {len(test_dataset)} test clips")
 
+    # ── optional: load Motion AE for AE-based FID (after FK to upper-body 3D)
+    ae_model = None
+    if args.motion_ae_ckpt is not None:
+        ae_model, _ae_cfg = load_motion_ae(args.motion_ae_ckpt, device=device)
+        print(f"Loaded H2S Motion AE from {args.motion_ae_ckpt}")
+
     # ── generate + render ─────────────────────────────────────────────────────
-    feats_gen  = []   # for FID
+    feats_gen  = []   # for naive (mean-pool) FID
     feats_real = []
+    feats_ae_gen, feats_ae_real = [], []
+    gen_seqs_all, gt_seqs_all = [], []
+    sentences_all = []
     dtw_list   = []
     mpjpe_list = []
 
@@ -501,21 +568,42 @@ def main(args):
             feats_gen.append(_pool_sequence(gen_seq))
             feats_real.append(_pool_sequence(gt_seq))
 
+            # Motion-AE FID: forward kinematics → upper-body 3D → encode
+            if ae_model is not None:
+                gen_3d = smplx_aa_to_upper3d(gen_seq, smpl_x, device=device)  # (T, 132)
+                gt_3d  = smplx_aa_to_upper3d(gt_seq,  smpl_x, device=device)
+                feats_ae_gen.append(encode_motion(ae_model, gen_3d, device=device))
+                feats_ae_real.append(encode_motion(ae_model, gt_3d,  device=device))
+
             # DTW and MPJPE on sequences of equal length (both are seq_len)
             dtw_list.append(compute_dtw(gen_seq, gt_seq))
             mpjpe_list.append(compute_mpjpe(gen_seq, gt_seq))
+            gen_seqs_all.append(gen_seq)
+            gt_seqs_all.append(gt_seq)
+            sentences_all.append(sentence)
 
     # ── compute and save metrics ───────────────────────────────────────────────
     if COMPUTE_METRICS and len(feats_gen) >= 2:
         import json
 
-        fid   = compute_fid(feats_real, feats_gen)
-        dtw   = float(np.mean(dtw_list))
-        mpjpe = float(np.mean(mpjpe_list))
+        fid    = compute_fid(feats_real, feats_gen)
+        fid_ae = (compute_fid(feats_ae_real, feats_ae_gen)
+                  if ae_model is not None else None)
+        region_slices = region_slices_for_dataset(
+            'How2SignSMPLX', n_feats=cfg.N_FEATS,
+        )
+        fid_region = compute_region_fid(feats_real, feats_gen, region_slices)
+        dtw    = float(np.mean(dtw_list))
+        mpjpe  = float(np.mean(mpjpe_list))
 
         metrics = {
             'num_samples': len(feats_gen),
             'FID':         round(fid,   4),
+            'FID_AE':      round(fid_ae, 4) if fid_ae is not None else None,
+            'FID_body':    fid_region.get('body'),
+            'FID_lhand':   fid_region.get('lhand'),
+            'FID_rhand':   fid_region.get('rhand'),
+            'FID_jaw':     fid_region.get('jaw'),
             'DTW':         round(dtw,   4),
             'MPJPE':       round(mpjpe, 4),
             'DTW_per_sample':   [round(v, 4) for v in dtw_list],
@@ -532,6 +620,27 @@ def main(args):
         print(f"  MPJPE: {mpjpe:.4f}  (feature-space proxy)")
         print("=" * 45)
         print(f"  Metrics saved → {metrics_path}")
+
+        if args.save_motion_dump:
+            ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+            gen_arr = np.empty(len(gen_seqs_all), dtype=object)
+            gt_arr  = np.empty(len(gt_seqs_all),  dtype=object)
+            for i, (g, t) in enumerate(zip(gen_seqs_all, gt_seqs_all)):
+                gen_arr[i] = np.asarray(g, dtype=np.float32)
+                gt_arr[i]  = np.asarray(t, dtype=np.float32)
+            # Big binary blob — keep in scratch alongside ckpt.
+            ckpt_dir  = os.path.dirname(args.checkpoint)
+            dump_path = os.path.join(
+                ckpt_dir,
+                f'motiondump_{ckpt_name}_n{len(gen_seqs_all)}_seed{args.seed}.npz'
+            )
+            np.savez_compressed(
+                dump_path,
+                gen_seqs=gen_arr, gt_seqs=gt_arr,
+                sentences=np.array(sentences_all, dtype=object),
+                kind=('nsa' if args.nsa else 'sentence'),
+            )
+            print(f"  Motion dump saved -> {dump_path}")
 
     elif COMPUTE_METRICS:
         print("WARNING: need >= 2 samples to compute FID, skipping metrics.")
@@ -557,6 +666,16 @@ if __name__ == "__main__":
     
     parser.add_argument("--seed",              type=int, default=42)
     parser.add_argument("--model_version", type=str, default='v1', choices=["v1", "v2"])
+    parser.add_argument("--nsa",            action="store_true", default=False,
+                        help="Eval Neural Sign Actors checkpoint instead of MDM.")
+    parser.add_argument("--motion_ae_ckpt", type=str, default=None,
+                        help="Path to a trained H2S MotionAutoencoder ckpt. "
+                             "If supplied, FID is also computed in the AE "
+                             "latent space (after FK to upper-body 3D) and "
+                             "reported as FID_AE.")
+    parser.add_argument("--save_motion_dump", action='store_true', default=False,
+                        help="Save raw gen/gt motion sequences as npz next to "
+                             "the ckpt, for FID_dyn / pose-deviation analysis.")
 
     args = parser.parse_args()
     main(args)

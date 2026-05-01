@@ -384,7 +384,12 @@ class How2SignSMPLXPhonoDataset(How2SignSMPLXDataset):
         return gloss_strings
 
     def __getitem__(self, idx):
-        seq, sentence, _, length = super().__getitem__(idx)
+        result = super().__getitem__(idx)
+        if self.use_fk_cache:
+            seq, sentence, _, length, gt_joints44 = result
+            gloss_string = self._gloss_strings[idx] if length > 0 else ''
+            return seq, sentence, gloss_string, length, gt_joints44
+        seq, sentence, _, length = result
         gloss_string = self._gloss_strings[idx] if length > 0 else ''
         return seq, sentence, gloss_string, length
 

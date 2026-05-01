@@ -11,7 +11,7 @@
 #SBATCH --mem=40gb
 #SBATCH --export=ALL
 #SBATCH --time=4-24:00:00
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=4
 
 module load gnu10
 module load python
@@ -19,7 +19,7 @@ module load python
 source /home/rhong5/py310Torch/bin/activate
 cd /home/rhong5/research_pro/hand_modeling_pro/aslSentenceAvatar
 
-for COND in sentence gloss sentence_gloss; do
+for COND in gloss sentence_gloss; do
     PORT=$(( (RANDOM << 8 | RANDOM) & 0xFFFF ))
     echo "=== Starting cond_mode=$COND  port=$PORT ==="
 

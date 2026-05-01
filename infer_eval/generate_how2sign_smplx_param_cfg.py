@@ -28,6 +28,10 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from network.MotionDiffusionModelV1_cfg import MotionDiffusionModelV1_CFG
+from utils.motion_ae_fid import load_motion_ae, encode_motion, smplx_aa_to_upper3d
+from utils.region_fid import (
+    region_slices_for_dataset, compute_region_fid,
+)
 from network.MotionDiffusionModelV2_cfg import MotionDiffusionModelV2_CFG
 from config import How2Sign_SMPLX_Config
 from dataloader.How2SignSMPLXDataset import How2SignSMPLXDataset
@@ -56,6 +60,7 @@ from generate_how2sign_smplx_param import (
     sample_gt_indices,
 )
 
+import json as _json
 from dataloader.How2SignSMPLXPhonoDataset import extract_gloss_string
 from utils.rotation_conversion import (
     TORSO_INDICES, ARMS_INDICES, LHAND_INDICES, RHAND_INDICES,
@@ -183,13 +188,6 @@ def process_one_sample(
     img_size=384, gif_fps=8,
     gloss_string=None, render_gif=True,
 ):
-    slug     = sentence_to_slug(sentence)
-    save_dir = os.path.join(output_dir, f"{idx:02d}_{slug}")
-    os.makedirs(save_dir, exist_ok=True)
-
-    with open(os.path.join(save_dir, 'sentence.txt'), 'w') as f:
-        f.write(sentence + '\n')
-
     print(f"\n[{idx}] {sentence}")
     print(f"     GT frames: {len(pkl_paths)}  ->  sample to {seq_len}")
 
@@ -198,16 +196,21 @@ def process_one_sample(
                              gloss_string=gloss_string)
 
     if render_gif:
+        slug     = sentence_to_slug(sentence)
+        save_dir = os.path.join(output_dir, f"{idx:02d}_{slug}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        with open(os.path.join(save_dir, 'sentence.txt'), 'w') as f:
+            f.write(sentence + '\n')
+
         gen_params = [split_params(motion[t]) for t in range(motion.shape[0])]
         render_to_gif(gen_params, smpl_x,
                       os.path.join(save_dir, 'generated.gif'),
                       img_size=img_size, gif_fps=gif_fps,
                       flip_coords=False)
 
-    # 2. GT
-    gt_indices  = sample_gt_indices(len(pkl_paths), seq_len)
-    selected    = [pkl_paths[i] for i in gt_indices]
-    gt_params   = load_gt_params(selected)
+    # 2. GT — load_gt_params handles both npz path (fast) and pkl list (legacy)
+    gt_params   = load_gt_params(pkl_paths, seq_len=seq_len)
 
     if render_gif:
         render_to_gif(gt_params, smpl_x,
@@ -241,18 +244,28 @@ def main(args):
     cfg.N_FEATS         = 6 if cfg.USE_ROT6D else 3
     cfg.TARGET_SEQ_LEN  = args.target_seq_len
     cfg.MODEL_VERSION   = args.model_version
+    if args.filter_words_min is not None:
+        cfg.FILTER_WORDS_MIN = args.filter_words_min
+    if args.filter_words_max is not None:
+        cfg.FILTER_WORDS_MAX = args.filter_words_max
     COMPUTE_METRICS     = args.compute_metrics
 
     # Load config from checkpoint
     ckpt_meta = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     ckpt_cfg = ckpt_meta.get('config', {})
+    cfg.MODEL_ARCH      = ckpt_cfg.get('MODEL_ARCH', 'mdm')
     cfg.PREDICTION_TYPE = ckpt_cfg.get('PREDICTION_TYPE', 'epsilon')
     cfg.UNCOND_PROB     = ckpt_cfg.get('UNCOND_PROB', 0.1)
     cfg.GUIDANCE_SCALE  = args.guidance_scale if args.guidance_scale is not None \
                           else ckpt_cfg.get('GUIDANCE_SCALE', 3.0)
     cfg.COND_MODE       = ckpt_cfg.get('COND_MODE', 'sentence')
+    cfg.USE_PHONO       = ckpt_cfg.get('USE_PHONO', False)
+    cfg.PHONO_DIM       = ckpt_cfg.get('PHONO_DIM', 64)
+    cfg.GLOSS_ENCODING  = ckpt_cfg.get('GLOSS_ENCODING', 'per_word')
+    cfg.REGRESSION_MODE = ckpt_cfg.get('REGRESSION_MODE', False)
     print(f"Prediction type: {cfg.PREDICTION_TYPE}, Guidance scale: {cfg.GUIDANCE_SCALE}, "
-          f"Cond mode: {cfg.COND_MODE}")
+          f"Cond mode: {cfg.COND_MODE}, Use phono: {cfg.USE_PHONO}, "
+          f"Gloss encoding: {cfg.GLOSS_ENCODING}")
     del ckpt_meta
 
     if args.poses_root is not None:
@@ -262,22 +275,25 @@ def main(args):
     cfg.CAMERA = 'rgb_front'
 
     # -- output dir
-    if args.output_dir is None:
-        checkpoint_dir = os.path.dirname(args.checkpoint)
-        logging_dir = checkpoint_dir.replace(
-            '/scratch/rhong5/weights/temp_training_weights/aslSentenceAvatar',
-            '/home/rhong5/research_pro/hand_modeling_pro/aslSentenceAvatar/zlog')
-        os.makedirs(logging_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(logging_dir, f"test_{timestamp}", 'gen_images')
-    else:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(args.output_dir, f"test_{timestamp}", 'gen_images')
+    checkpoint_dir = os.path.dirname(args.checkpoint)
+    logging_dir = checkpoint_dir.replace(
+        '/scratch/rhong5/weights/temp_training_weights/aslSentenceAvatar',
+        '/home/rhong5/research_pro/hand_modeling_pro/aslSentenceAvatar/zlog')
+    if args.output_dir is not None:
+        logging_dir = args.output_dir
+    os.makedirs(logging_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Output dir: {output_dir}")
+    if RENDER_GIF:
+        output_dir = os.path.join(logging_dir, f"test_{timestamp}", 'gen_images')
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Output dir: {output_dir}")
+    else:
+        output_dir = None
+        print(f"Metrics-only mode (no rendering)")
 
     # -- dataset
+    # eval uses aggregated npz fast path (load_gt_params auto-detects)
     test_dataset = How2SignSMPLXDataset(mode='test', cfg=cfg)
     cfg.INPUT_DIM = test_dataset.input_dim
 
@@ -291,7 +307,16 @@ def main(args):
     model = load_model_weight(model, args.checkpoint, device)
 
     # -- SMPL-X renderer (only needed for GIF rendering)
-    smpl_x = load_smplx_model(cfg.HUMAN_MODELS_PATH) if RENDER_GIF else None
+    # smpl_x needed for: rendering OR forward kinematics (motion-AE FID)
+    need_smplx = RENDER_GIF or (args.motion_ae_ckpt is not None)
+    smpl_x = load_smplx_model(cfg.HUMAN_MODELS_PATH) if need_smplx else None
+
+    # Optional Motion AE for AE-based FID (after FK to upper-body 3D)
+    ae_model = None
+    if args.motion_ae_ckpt is not None:
+        ae_model, _ae_cfg = load_motion_ae(args.motion_ae_ckpt, device=device)
+        print(f"Loaded H2S Motion AE from {args.motion_ae_ckpt}")
+    feats_ae_gen, feats_ae_real = [], []
 
     # -- sample test sentences
     n_samples = min(args.num_samples, len(test_dataset))
@@ -314,11 +339,19 @@ def main(args):
     need_gloss = cfg.COND_MODE in ('gloss', 'sentence_gloss')
     gloss_cache = {}
     if need_gloss:
-        print(f"Pre-computing pseudo-gloss strings for {n_samples} test samples...")
-        for ds_idx in sample_indices:
-            sentence, _ = test_dataset.data_list[ds_idx]
-            if sentence not in gloss_cache:
-                gloss_cache[sentence] = extract_gloss_string(sentence)
+        if args.gloss_source == 'llm_draft':
+            cache_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'cache', 'llm_draft_gloss_test.json')
+            with open(cache_path) as f:
+                gloss_cache = _json.load(f)
+            print(f"Loaded {len(gloss_cache)} LLM draft glosses from {cache_path}")
+        else:
+            print(f"Pre-computing pseudo-gloss strings for {n_samples} test samples...")
+            for ds_idx in sample_indices:
+                sentence, _ = test_dataset.data_list[ds_idx]
+                if sentence not in gloss_cache:
+                    gloss_cache[sentence] = extract_gloss_string(sentence)
 
     for rank, ds_idx in enumerate(tqdm(sample_indices, desc="Processing")):
         sentence, pkl_paths = test_dataset.data_list[ds_idx]
@@ -342,6 +375,11 @@ def main(args):
         if COMPUTE_METRICS:
             feats_gen.append(_pool_sequence(gen_seq))
             feats_real.append(_pool_sequence(gt_seq))
+            if ae_model is not None:
+                gen_3d = smplx_aa_to_upper3d(gen_seq, smpl_x, device=device)
+                gt_3d  = smplx_aa_to_upper3d(gt_seq,  smpl_x, device=device)
+                feats_ae_gen.append(encode_motion(ae_model, gen_3d, device=device))
+                feats_ae_real.append(encode_motion(ae_model, gt_3d,  device=device))
             gen_seqs_all.append(gen_seq)
             gt_seqs_all.append(gt_seq)
             sentences_all.append(sentence)
@@ -357,6 +395,12 @@ def main(args):
         import json
 
         fid       = compute_fid(feats_real, feats_gen)
+        fid_ae    = (compute_fid(feats_ae_real, feats_ae_gen)
+                     if ae_model is not None else None)
+        region_slices = region_slices_for_dataset(
+            'How2SignSMPLX', n_feats=cfg.N_FEATS,
+        )
+        fid_region = compute_region_fid(feats_real, feats_gen, region_slices)
         dtw       = float(np.mean(dtw_list))
         diversity = compute_diversity(gen_seqs_all)
 
@@ -372,6 +416,8 @@ def main(args):
         jerk_gen = float(np.mean(jerk_gen_list))
         jerk_gt  = float(np.mean(jerk_gt_list))
 
+        ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+
         metrics = {
             'config': {
                 'cond_mode':       cfg.COND_MODE,
@@ -379,10 +425,17 @@ def main(args):
                 'guidance_scale':  cfg.GUIDANCE_SCALE,
                 'num_samples':     len(feats_gen),
                 'seed':            args.seed,
+                'checkpoint':      args.checkpoint,
+                'checkpoint_name': ckpt_name,
             },
             'distribution': {
                 'FID':       round(fid, 4),
+                'FID_AE':    round(fid_ae, 4) if fid_ae is not None else None,
                 'Diversity': round(diversity, 4),
+                'FID_body':  fid_region.get('body'),
+                'FID_lhand': fid_region.get('lhand'),
+                'FID_rhand': fid_region.get('rhand'),
+                'FID_jaw':   fid_region.get('jaw'),
             },
             'reconstruction': {
                 **mpjpe_agg,
@@ -396,7 +449,10 @@ def main(args):
             },
         }
 
-        metrics_path = os.path.join(os.path.dirname(output_dir), 'metrics.json')
+        if output_dir is not None:
+            metrics_path = os.path.join(os.path.dirname(output_dir), 'metrics.json')
+        else:
+            metrics_path = os.path.join(logging_dir, f'metrics_{ckpt_name}_{timestamp}.json')
         with open(metrics_path, 'w') as f:
             json.dump(metrics, f, indent=2)
 
@@ -416,10 +472,31 @@ def main(args):
         print("=" * 60)
         print(f"  Metrics saved -> {metrics_path}")
 
+        if args.save_motion_dump:
+            gen_arr = np.empty(len(gen_seqs_all), dtype=object)
+            gt_arr  = np.empty(len(gt_seqs_all),  dtype=object)
+            for i, (g, t) in enumerate(zip(gen_seqs_all, gt_seqs_all)):
+                gen_arr[i] = np.asarray(g, dtype=np.float32)
+                gt_arr[i]  = np.asarray(t, dtype=np.float32)
+            # Big binary blob — keep in scratch alongside ckpt.
+            ckpt_dir = os.path.dirname(args.checkpoint)
+            dump_path = os.path.join(
+                ckpt_dir,
+                f'motiondump_{ckpt_name}_n{len(gen_seqs_all)}_seed{args.seed}.npz'
+            )
+            np.savez_compressed(
+                dump_path,
+                gen_seqs=gen_arr, gt_seqs=gt_arr,
+                sentences=np.array(sentences_all, dtype=object),
+                kind=cfg.COND_MODE,
+                gloss_source=getattr(args, 'gloss_source', 'rule_based'),
+            )
+            print(f"  Motion dump saved -> {dump_path}")
+
     elif COMPUTE_METRICS:
         print("WARNING: need >= 2 samples to compute FID, skipping metrics.")
 
-    print(f"\nDone! Results in: {output_dir}")
+    print(f"\nDone!")
 
 
 if __name__ == "__main__":
@@ -438,11 +515,27 @@ if __name__ == "__main__":
     parser.add_argument("--no_root_normalize", action="store_true")
     parser.add_argument("--compute_metrics",   action="store_true")
 
+    parser.add_argument("--filter_words_min",  type=int, default=None,
+                        help="If set, drop test sentences with fewer words.")
+    parser.add_argument("--filter_words_max",  type=int, default=None,
+                        help="If set, drop test sentences with more words.")
     parser.add_argument("--seed",              type=int, default=42)
     parser.add_argument("--model_version",     type=str, default='v1', choices=["v1", "v2"])
     parser.add_argument("--guidance_scale",    type=float, default=None,
                         help="Override guidance scale (default: from checkpoint)")
     parser.add_argument("--render",            action="store_true",
                         help="Render GIFs (skip by default for metric-only runs)")
+    parser.add_argument("--motion_ae_ckpt",  type=str, default=None,
+                        help="Path to a trained H2S MotionAutoencoder ckpt. "
+                             "If supplied, FID is also computed in the AE "
+                             "latent space (after FK to upper-body 3D) and "
+                             "reported as FID_AE.")
+    parser.add_argument("--gloss_source",     type=str, default='rule_based',
+                        choices=['rule_based', 'llm_draft'],
+                        help="Gloss source: rule_based or llm_draft")
+    parser.add_argument("--save_motion_dump", action='store_true', default=False,
+                        help="Save raw gen/gt motion sequences as npz next to "
+                             "the metrics JSON, for FID_dyn / pose-deviation "
+                             "analysis.")
     args = parser.parse_args()
     main(args)

@@ -32,10 +32,11 @@ from accelerate.logging import get_logger
 
 from dataloader.How2SignSMPLXDataset       import How2SignSMPLXDataset
 from dataloader.How2SignSMPLXPhonoDataset  import How2SignSMPLXPhonoDataset
+from dataloader.Phoenix2DDataset           import Phoenix2DDataset
 from network.NeuralSignActorsModel         import NeuralSignActorsModel, nsa_loss
 from network.PhonoSignActorsModel          import PhonoSignActorsModel
 from utils.utils import plot_training_curves, backup_code, create_padding_mask
-from config import How2Sign_SMPLX_Config
+from config import How2Sign_SMPLX_Config, Phoenix2D_Config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,21 +65,36 @@ class NSATrainer:
         self.debug = args.debug
 
         # ── config ────────────────────────────────────────────────────────────
-        cfg = How2Sign_SMPLX_Config()
-        cfg.DATASET_NAME         = "How2SignSMPLX"
+        if args.dataset == "Phoenix2D":
+            cfg = Phoenix2D_Config()
+        else:
+            cfg = How2Sign_SMPLX_Config()
+        cfg.DATASET_NAME         = args.dataset
         cfg.USE_ROT6D            = args.use_rot6d
         cfg.USE_UPPER_BODY       = args.use_upper_body
+        cfg.EXCLUDE_JAW          = args.exclude_jaw
         cfg.ROOT_NORMALIZE       = args.root_normalize
         cfg.USE_EXPRESSION       = args.use_expression
         cfg.N_EXPR               = 10
-        cfg.PROJECT_NAME         = "NeuralSignActors"
+        cfg.PROJECT_NAME         = "NeuralSignActors" if args.dataset != "Phoenix2D" \
+                                   else "NeuralSignActorsPhoenix"
         cfg.MODEL_VERSION        = 'NeuralSignActors'
-        cfg.N_FEATS              = 6 if cfg.USE_ROT6D else 3
+        # Phoenix uses 3-D MediaPipe coords (xyz). For Phoenix, n_feats is fixed
+        # at 3 regardless of --use_rot6d.
+        cfg.N_FEATS              = 3 if args.dataset == "Phoenix2D" \
+                                   else (6 if cfg.USE_ROT6D else 3)
         cfg.USE_MINI_DATASET     = args.use_mini_dataset
         cfg.USE_PHONO_ATTRIBUTE  = args.use_phono_attribute
+        # Phoenix-specific: gloss source for any future gloss-condition runs
+        if args.dataset == "Phoenix2D":
+            cfg.GLOSS_SOURCE = args.gloss_source
 
-        # Paper: CLIP-ViT-L-14
+        # Paper: CLIP-ViT-L-14 by default. For non-English datasets (Phoenix DE)
+        # pass --text_encoder_type mclip to use multilingual xlm-roberta-base.
         cfg.CLIP_MODEL_NAME = 'openai/clip-vit-large-patch14'
+        cfg.TEXT_ENCODER_TYPE = args.text_encoder_type
+        if args.text_encoder_type == 'mclip':
+            cfg.MCLIP_MODEL_NAME = args.mclip_model_name
 
         # Architecture (paper: 4 layers each)
         cfg.GNN_JOINT_DIM  = getattr(cfg, 'GNN_JOINT_DIM', 128)
@@ -102,6 +118,18 @@ class NSATrainer:
         if args.batch_size: cfg.TRAIN_BSZ     = args.batch_size
         if args.epochs:     cfg.MAX_EPOCHS    = args.epochs
         if args.lr:         cfg.LEARNING_RATE = args.lr
+        if args.mixed_precision:
+            cfg.MIXED_PRECISION = args.mixed_precision
+        cfg.NSA_LOSS_TYPE = args.loss_type
+        cfg.PRELOAD_TO_MEMORY = args.preload_to_memory
+        if args.num_workers is not None:
+            cfg.NUM_WORKERS = args.num_workers
+        if args.target_seq_len is not None:
+            cfg.TARGET_SEQ_LEN = args.target_seq_len
+        if args.filter_words_min is not None:
+            cfg.FILTER_WORDS_MIN = args.filter_words_min
+        if args.filter_words_max is not None:
+            cfg.FILTER_WORDS_MAX = args.filter_words_max
 
         self.cfg = cfg
 
@@ -172,13 +200,20 @@ class NSATrainer:
     def _build_components(self):
         self.logger.info("Building dataset and model...")
 
-        DatasetCls = How2SignSMPLXPhonoDataset if self.cfg.USE_GLOSS_CONDITION \
-                     else How2SignSMPLXDataset
-        train_ds = DatasetCls(mode='train', cfg=self.cfg, logger=self.logger)
-        val_ds   = DatasetCls(mode='val',   cfg=self.cfg, logger=self.logger)
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            train_ds = Phoenix2DDataset(mode='train', cfg=self.cfg, logger=self.logger)
+            val_ds   = Phoenix2DDataset(mode='dev',   cfg=self.cfg, logger=self.logger)
+        else:
+            DatasetCls = How2SignSMPLXPhonoDataset if self.cfg.USE_GLOSS_CONDITION \
+                         else How2SignSMPLXDataset
+            train_ds = DatasetCls(mode='train', cfg=self.cfg, logger=self.logger)
+            val_ds   = DatasetCls(mode='val',   cfg=self.cfg, logger=self.logger)
 
         # INPUT_DIM is set from dataset: n_joints*n_feats [+ n_expr]
         self.cfg.INPUT_DIM     = train_ds.input_dim
+        # Phoenix: sync body_k for the Phoenix loss split (mirrors cfg trainer).
+        if hasattr(train_ds, 'body_k'):
+            self.cfg.PHOENIX_BODY_K = train_ds.body_k
         self.cfg.NUM_CLASSES   = 0
         self.cfg.GLOSS_NAME_LIST = []
 
@@ -186,28 +221,45 @@ class NSATrainer:
             self.cfg.TRAIN_BSZ = min(self.cfg.TRAIN_BSZ, 4)
             self.cfg.EVAL_BSZ  = min(self.cfg.EVAL_BSZ, 4)
             
+        # When preloading to RAM, workers can fork the cache cheaply and stay alive
+        # across epochs to avoid re-forking. Without preload, default behaviour.
+        persistent = bool(getattr(self.cfg, 'PRELOAD_TO_MEMORY', False)) \
+                     and self.cfg.NUM_WORKERS > 0
+
         self.train_loader = DataLoader(
             train_ds,
-            batch_size   = self.cfg.TRAIN_BSZ,
-            shuffle      = True,
-            collate_fn   = collate_fn,
-            num_workers  = self.cfg.NUM_WORKERS,
-            pin_memory   = True,
-            drop_last    = True,
+            batch_size         = self.cfg.TRAIN_BSZ,
+            shuffle            = True,
+            collate_fn         = collate_fn,
+            num_workers        = self.cfg.NUM_WORKERS,
+            pin_memory         = True,
+            drop_last          = True,
+            persistent_workers = persistent,
         )
         self.val_loader = DataLoader(
             val_ds,
-            batch_size   = self.cfg.EVAL_BSZ,
-            shuffle      = False,
-            collate_fn   = collate_fn,
-            num_workers  = self.cfg.NUM_WORKERS,
-            pin_memory   = True,
+            batch_size         = self.cfg.EVAL_BSZ,
+            shuffle            = False,
+            collate_fn         = collate_fn,
+            num_workers        = self.cfg.NUM_WORKERS,
+            pin_memory         = True,
+            persistent_workers = persistent,
         )
         self.logger.info(
             f"Train: {len(train_ds):,} samples  "
             f"Val: {len(val_ds):,} samples  "
             f"INPUT_DIM: {self.cfg.INPUT_DIM}"
         )
+
+        # Phoenix uses MediaPipe topology — body_k body joints, then 21 lhand,
+        # then 21 rhand. Hand-up-weighting in nsa_loss must use these indices,
+        # not the SMPL-X LHAND/RHAND sets.
+        if self.cfg.DATASET_NAME == "Phoenix2D":
+            body_k = getattr(self.cfg, 'PHOENIX_BODY_K', 25)
+            hand_k = getattr(self.cfg, 'PHOENIX_HAND_K', 21)
+            self._phoenix_hand_set = set(range(body_k, body_k + 2 * hand_k))
+        else:
+            self._phoenix_hand_set = None
 
         # Model
         ModelCls = PhonoSignActorsModel if self.cfg.USE_GLOSS_CONDITION \
@@ -282,6 +334,8 @@ class NSATrainer:
             active_joints = unwrapped.active_joints,
             use_expr      = unwrapped.use_expr,
             n_expr        = unwrapped.n_expr,
+            loss_type     = getattr(self.cfg, 'NSA_LOSS_TYPE', 'mse'),
+            hand_joints_override = self._phoenix_hand_set,
         )
         if return_diag:
             return loss, eps_pred.detach()
@@ -314,14 +368,23 @@ class NSATrainer:
                         diag_acts[name] = (t.detach().abs().mean().item(),
                                            t.detach().float().std().item())
                     return _hook
-                targets = {
-                    'gnn_layer0': unwrapped.pose_encoder.gnn_layers[0],
-                    'gnn_final':  unwrapped.pose_encoder,
-                    'pose_proj':  unwrapped.pose_flat_proj,
-                    't_proj':     unwrapped.t_proj,
-                    'lstm':       unwrapped.lstm,
-                    'rh_final':   unwrapped.regress_head,
-                }
+                if getattr(unwrapped, 'use_3d_input', False):
+                    targets = {
+                        'pose_mlp':   unwrapped.pose_per_joint,
+                        'pose_proj':  unwrapped.pose_flat_proj,
+                        't_proj':     unwrapped.t_proj,
+                        'lstm':       unwrapped.lstm,
+                        'rh_final':   unwrapped.regress_head,
+                    }
+                else:
+                    targets = {
+                        'gnn_layer0': unwrapped.pose_encoder.gnn_layers[0],
+                        'gnn_final':  unwrapped.pose_encoder,
+                        'pose_proj':  unwrapped.pose_flat_proj,
+                        't_proj':     unwrapped.t_proj,
+                        'lstm':       unwrapped.lstm,
+                        'rh_final':   unwrapped.regress_head,
+                    }
                 for name, mod in targets.items():
                     hook_handles.append(mod.register_forward_hook(_make_hook(name)))
 
@@ -346,12 +409,17 @@ class NSATrainer:
                         return f"{p.grad.abs().mean().item():.4e}" if p.grad is not None else "None"
                     rh_w    = unwrapped.regress_head[-1].weight
                     lstm_hh = unwrapped.lstm.weight_hh_l0
-                    gnn_w   = unwrapped.pose_encoder.gnn_layers[0].W
+                    if getattr(unwrapped, 'use_3d_input', False):
+                        enc_w     = unwrapped.pose_per_joint[0].weight
+                        enc_label = 'mlp_W0'
+                    else:
+                        enc_w     = unwrapped.pose_encoder.gnn_layers[0].W
+                        enc_label = 'gnn_W0'
                     self.logger.info(
                         f"[DIAG e{epoch}] "
                         f"eps_pred |mean|={eps_pred_diag.abs().mean().item():.4e} "
                         f"std={eps_pred_diag.std().item():.4e} | "
-                        f"grad rh={_g(rh_w)} lstm_hh0={_g(lstm_hh)} gnn_W0={_g(gnn_w)} | "
+                        f"grad rh={_g(rh_w)} lstm_hh0={_g(lstm_hh)} {enc_label}={_g(enc_w)} | "
                         f"|w| rh={rh_w.abs().mean().item():.4e} "
                         f"lstm_hh0={lstm_hh.abs().mean().item():.4e}"
                     )
@@ -360,8 +428,10 @@ class NSATrainer:
                     )
                     self.logger.info(f"[DIAG e{epoch} acts] {act_str}")
 
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                if self.accelerator.sync_gradients and self.args.clip_grad_norm > 0:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), self.args.clip_grad_norm
+                    )
                 self.optimizer.step()
                 self.lr_sched.step()
                 self.optimizer.zero_grad()
@@ -424,6 +494,8 @@ class NSATrainer:
                 active_joints = unwrapped.active_joints,
                 use_expr      = unwrapped.use_expr,
                 n_expr        = unwrapped.n_expr,
+                loss_type     = getattr(self.cfg, 'NSA_LOSS_TYPE', 'mse'),
+                hand_joints_override = self._phoenix_hand_set,
             )
             total_loss += loss.item()
             n          += 1
@@ -548,11 +620,18 @@ def parse_args():
     p.add_argument('--batch_size',          type=int,   default=None)
     p.add_argument('--epochs',              type=int,   default=None)
     p.add_argument('--lr',                  type=float, default=None)
+    p.add_argument('--mixed_precision',     type=str,   default=None,
+                   choices=['no', 'fp16', 'bf16'])
+    p.add_argument('--loss_type',           type=str,   default='mse',
+                   choices=['mse', 'l2'],
+                   help="mse=squared L2 (collapses), l2=norm (matches paper Eq.7)")
     p.add_argument('--resume',              type=str,   default=None)
     p.add_argument('--finetune',            action='store_true')
     p.add_argument('--debug',               action='store_true')
     p.add_argument('--use_rot6d',           action='store_true', default=False)
     p.add_argument('--use_upper_body',      action='store_true', default=False)
+    p.add_argument('--exclude_jaw',         action='store_true', default=False,
+                help='Bypass jaw joint (matches paper: facial via expression, not jaw rot)')
     p.add_argument('--root_normalize',      action='store_true', default=False,
                 help='Zero out root joint (not in paper)')
     p.add_argument('--use_expression',      action='store_true', default=False,
@@ -565,6 +644,31 @@ def parse_args():
     p.add_argument('--use_cross_attn',      action='store_true', default=False,
                    help='Enable per-frame cross-attention over gloss tokens (M2). '
                         'Implies --use_gloss_condition.')
+    p.add_argument('--preload_to_memory',   action='store_true', default=False,
+                   help='Load all per-frame pkls into RAM in dataset.__init__ '
+                        '(eliminates per-batch IO bottleneck).')
+    p.add_argument('--num_workers',         type=int, default=None,
+                   help='DataLoader num_workers override.')
+    p.add_argument('--dataset',             type=str,   default='How2SignSMPLX',
+                   choices=['How2SignSMPLX', 'Phoenix2D'],
+                   help='Which dataset to train on. Phoenix2D uses MediaPipe '
+                        'upper-body 201-D coords (no SMPL-X kinematic tree).')
+    p.add_argument('--gloss_source',        type=str,   default='gt',
+                   choices=['gt', 'translation', 'pseudo_rule', 'llm_draft'],
+                   help='Phoenix only: which gloss column to expose as the '
+                        '4-tuple gloss_string. NSA itself ignores it (sentence-only).')
+    p.add_argument('--target_seq_len',      type=int,   default=None)
+    p.add_argument('--text_encoder_type',   type=str,   default='clip',
+                   choices=['clip', 'mclip'])
+    p.add_argument('--mclip_model_name',    type=str,   default='xlm-roberta-base')
+    p.add_argument('--filter_words_min',    type=int,   default=None)
+    p.add_argument('--filter_words_max',    type=int,   default=None)
+    p.add_argument('--clip_grad_norm',      type=float, default=1.0,
+                   help='Max gradient norm (default 1.0). Hypothesis: with L2 '
+                        'loss + per-joint weighting, true grad norm ≈ 150-200, '
+                        'so clip=1.0 squashes effective LR ≈150x → noise drives '
+                        'regress_head to 0. Try --clip_grad_norm 50 or higher; '
+                        'set to 0 to disable clipping entirely.')
     return p.parse_args()
 
 

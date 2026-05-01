@@ -36,6 +36,12 @@ class BaseConfig:
         # ==================== Hardware ====================
         self.MIXED_PRECISION = "fp16"
         self.NUM_WORKERS = 4
+        # Preload all per-frame pkls into RAM in dataset.__init__.
+        # Saves ~30-100× per-batch IO at the cost of ~2-3GB resident memory.
+        self.PRELOAD_TO_MEMORY = False
+        # Workers used during the one-time preload (reuses CPU budget; not
+        # active during training, so DataLoader's NUM_WORKERS isn't competing).
+        self.PRELOAD_WORKERS = 5
         
         # ==================== Logging & Checkpoints ====================
         self.PROJECT_NAME = "ASLSenAvatar"
@@ -82,6 +88,7 @@ class BaseConfig:
 
         # ==================== Voting Module ====================
         self.GLOSS_SOURCE = 'rule_based'  # 'rule_based' or 'llm_draft'
+        self.GLOSS_ENCODING = 'per_word'  # 'per_word' (default) or 'whole_str'
         self.VOTING_N_LAYERS = 2
         self.VOTING_N_HEADS = 4
         self.VOTING_FF_MULT = 2
@@ -89,11 +96,62 @@ class BaseConfig:
         self.SPARSE_WEIGHT = 0.01
         self.ENTROPY_WEIGHT = 0.01
 
+        # ==================== Fusion Module ====================
+        self.FUSION_N_LAYERS = 2
+        self.FUSION_N_HEADS = 8
+        self.SENT_COND_MODE = 'none'  # 'none', 'prefix', 'kv_pool'
+
+        # ==================== Phonological Attributes ====================
+        self.USE_PHONO = False
+        self.PHONO_DIM = 64
+        self.SIGNBANK_CSV = 'data/ASL_signbank/asl_signbank_dictionary-export.csv'
+
+
+
+class Phoenix2D_Config(BaseConfig):
+    """RWTH-PHOENIX-2014T 2D-keypoint training config."""
+
+    def __init__(self):
+        super().__init__()
+        self.DATASET_NAME      = "Phoenix2D"
+        self.PHOENIX_ROOT      = "/scratch/rhong5/dataset/RWTH-PHOENIX-2014"
+        self.PHOENIX_USE_FACE  = False
+        # body 33 + lhand 21 + rhand 21 = 75 keypoints * 3 dims = 225
+        self.MAX_SEQ_LEN       = 200
+        self.TARGET_SEQ_LEN    = 160
+        self.INTERPOLATE_SHORT_SEQ = False
+
+        # Phoenix has no SMPL-X joint structure → treat input as flat features.
+        self.USE_3D_INPUT      = True
+        self.ROOT_NORMALIZE    = True   # dataset centres on hip; model bypass off via USE_3D_INPUT
+        self.USE_UPPER_BODY    = True   # drop MediaPipe pose 25..32 (legs/feet)
+
+        # Loss split inside CFG trainer when DATASET_NAME=Phoenix2D.
+        # body_k=25 when USE_UPPER_BODY; sync via cfg.USE_UPPER_BODY at training time.
+        self.PHOENIX_BODY_K    = 25     # head + arms + hips
+        self.PHOENIX_HAND_K    = 21
+
+        self.LATENT_DIM        = 256
+        self.MODEL_DIM         = 512
+        self.N_HEADS           = 8
+        self.N_LAYERS          = 4
+        self.DROPOUT           = 0.1
+
+        self.TRAIN_BSZ         = 64
+        self.EVAL_BSZ          = 64
+        self.MAX_EPOCHS        = 200
+        self.LEARNING_RATE     = 1e-4
+
+        self.MODEL_VERSION     = 'v1'
+        self.DATASET_VERSION   = 'v1'
+
+        # Phoenix gloss source for cond_mode='gloss'
+        self.GLOSS_SOURCE      = 'gt'   # 'gt' (orth) | 'translation'
 
 
 class How2Sign_SMPLX_Config(BaseConfig):
     """Training configuration"""
-    
+
     def __init__(self):
         super().__init__()
         # ==================== Dataset ====================

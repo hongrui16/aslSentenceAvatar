@@ -1,6 +1,6 @@
 ---
 name: Reorder & Fusion — Candidate A chosen (cross-attention)
-description: User chose Candidate A (implicit reorder via cross-attention). Implemented as VotingFusionModule + V1_votingfusion. Candidate B (explicit permutation) rejected.
+description: User chose Candidate A (implicit reorder via cross-attention). Implemented as VoteAlignModule + V1_votingfusion. Candidate B (explicit permutation) rejected.
 type: project
 ---
 
@@ -18,8 +18,8 @@ User chose implicit reorder via cross-attention over explicit learned permutatio
 
 | File | Role |
 |------|------|
-| `network/VotingFusionModule.py` | Stage 1: voting gate (same as VotingConditionModule). Stage 2: TransformerDecoder cross-attention — motion queries attend to gated gloss keys. Output: per-frame condition (B, T, D). |
-| `network/MotionDiffusionModelV1_votingfusion.py` | Extends V1_cfg. Overrides `denoise()` to use VotingFusionModule. CFG uncond path falls back to single null_cond_emb token. |
+| `network/VoteAlignModule.py` | Stage 1: voting gate (same as VotingConditionModule). Stage 2: TransformerDecoder cross-attention — motion queries attend to gated gloss keys. Output: per-frame condition (B, T, D). |
+| `network/MotionDiffusionModelV1_votingfusion.py` | Extends V1_cfg. Overrides `denoise()` to use VoteAlignModule. CFG uncond path falls back to single null_cond_emb token. |
 | `trainMotionDiffusion_votingfusion.py` | Training script. Uses `How2SignSMPLXVotingDataset` (LLM draft gloss). New args: `--fusion_n_layers`, `--fusion_n_heads`. |
 | `trainMotionDiffusion_votingfusion.slurm` | SLURM job script. |
 
@@ -30,7 +30,7 @@ V1_voting:       gloss → vote → weighted_mean_pool → single vector (B, D) 
 V1_votingfusion: gloss → vote → gated tokens (B, K, D) → cross-attn with motion (B, T, D) → per-frame condition
 ```
 
-Key: V1_votingfusion's `denoise()` prepends timestep token to motion, then runs VotingFusionModule (vote + fuse), then runs transformer encoder. The cross-attention in the fusion decoder implicitly learns which gloss is relevant at which time step = soft temporal alignment.
+Key: V1_votingfusion's `denoise()` prepends timestep token to motion, then runs VoteAlignModule (vote + fuse), then runs transformer encoder. The cross-attention in the fusion decoder implicitly learns which gloss is relevant at which time step = soft temporal alignment.
 
 ## Log/checkpoint paths
 
