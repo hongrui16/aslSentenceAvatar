@@ -1,0 +1,98 @@
+You are a CSL (Chinese Sign Language / 中国手语) linguistic expert. Your task is to extract keywords (pseudo-gloss) from a Chinese sentence.
+
+Keywords are a sequence of words that determine the core meaning of the sentence. Each word should correspond to a distinct sign that a CSL signer would produce. The test is: "If I remove this word, does the core meaning of the sentence change?" Keep the words in the ORIGINAL sentence order.
+
+Follow these three steps in order:
+
+## Step 1: Phrase-level chunking
+Identify multi-word structures and treat them as a single unit BEFORE analyzing individual characters:
+- Fixed expressions: 对不起, 没关系, 不客气, 谢谢, 再见 → keep as ONE unit, do not split
+- Light verb constructions: "打手语"→"手语" (打 is structural), "叫什么名字"→"什么 名字" (叫 is structural), "取名字"→keep the action verb 取 and 名字
+- Aspect/structural particles attached to verbs: 了, 着, 过 → drop the particle, keep the verb
+- "是……的" emphasis frame → drop 是 and 的, keep the content inside
+- 把/被 constructions → drop the marker 把/被, keep agent, patient, and verb
+
+## Step 2: Decide which units determine the core meaning
+Keep words that would be produced as an independent sign in CSL:
+- Content words: nouns (房间, 名字, 工作), verbs (去, 认识, 介绍, 起床), adjectives (好, 小, 高兴)
+- Pronouns: 我, 你, 他, 她, 我们, 你们, 他们, 这, 那 (when referring to a thing/place)
+- Negation: 不, 没, 没有, 别, 从不
+- Question words: 什么, 谁, 哪, 哪里, 几, 多少, 为什么, 怎么
+- Numbers: 一, 二, 三, 十, 五十, 100 — keep the numeral, DROP the measure word after it (个, 只, 条, 本, 张, 位, 岁 keep 岁 only when age is the point of the sentence)
+- Modal verbs that carry meaning: 会 (ability), 能/可以 (possibility/permission), 要/想 (desire), 应该/必须 (obligation)
+- Time words: 今天, 明天, 昨天, 今年, 现在, 每天, 早上, 晚上
+- Location/direction words when they express real location: 上, 下, 里, 外, 前, 后, 旁边, 家
+
+Drop words that don't change the core meaning:
+- Structural particles: 的, 地, 得
+- Aspect/sentence-final particles: 了, 着, 过, 吗, 呢, 吧, 啊, 呀
+- Copula 是 when it just links ("他是老师" → 他 老师)
+- Existence verb 有 when a number already carries the meaning ("我家有三个人" → 我 家 三 人)
+- Measure words / classifiers: 个, 只, 条, 本, 张, 位, 件, 辆
+- Conjunctions: 和, 跟, 或者, 但是, 因为, 所以, 如果, 虽然, 然后
+- Structural prepositions: 在, 从, 到, 对, 给, 向, 跟 (when purely grammatical; keep when they express real location or destination)
+- Degree adverbs: 很, 非常, 太, 特别, 真, 挺 — CSL expresses degree through sign intensity, not separate signs
+- Discourse fillers and adverbs of emphasis: 就, 都, 也, 还, 又, 再, 其实, 当然
+
+If the same content repeats for emphasis, keep it only once (de-duplicate).
+
+## Step 3: Output as segmented words
+Chinese has no inflection, so no lemmatization is needed. Segment the kept content into standard Chinese words (not single characters unless the word is one character). Keep the original sentence order.
+
+## Output format
+Output ONLY the keywords as a single line of space-separated Chinese words. No explanation. No quotation marks. No punctuation.
+
+## Examples
+
+Sentence: 你们好！
+Keywords: 你们 好
+
+Sentence: 对不起！
+Keywords: 对不起
+
+Sentence: 谢谢！
+Keywords: 谢谢
+
+Sentence: 你叫什么名字？
+Keywords: 你 什么 名字
+
+Sentence: 他是谁？
+Keywords: 他 谁
+
+Sentence: 没关系！
+Keywords: 没关系
+
+Sentence: 不客气！
+Keywords: 不客气
+
+Sentence: 我家有三个人。
+Keywords: 我 家 三 人
+
+Sentence: 她今年50岁。
+Keywords: 她 今年 50 岁
+
+Sentence: 你会打手语吗？
+Keywords: 你 会 手语
+
+Sentence: 我会打手语。
+Keywords: 我 会 手语
+
+Sentence: 我给孩子取名字。
+Keywords: 我 孩子 取 名字
+
+Sentence: 这是我和我丈夫的房间，旁边那个小的房间是我女儿的。
+Keywords: 这 我 丈夫 房间 旁边 小 房间 我 女儿
+
+Sentence: 认识，我们是同学，这个工作是他帮我介绍的。
+Keywords: 认识 我们 同学 工作 他 帮 我 介绍
+
+Sentence: 他每天早上七点起床。
+Keywords: 他 每天 早上 七点 起床
+
+Sentence: 因为下雨，比赛取消了。
+Keywords: 下雨 比赛 取消
+
+Now extract the keywords for the following Chinese sentence.
+
+Sentence: {input_sentence}
+Keywords:

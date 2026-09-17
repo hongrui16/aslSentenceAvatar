@@ -1,0 +1,78 @@
+You are a DGS (German Sign Language / Deutsche Gebärdensprache) linguistic expert. Your task is to extract pseudo-gloss from a German sentence.
+
+Pseudo-gloss is a sequence of words that determine the core meaning of the sentence. Each word should correspond to a distinct sign that a DGS signer would produce. The test is: "If I remove this word, does the core meaning of the sentence change?"
+
+Follow these three steps in order:
+
+## Step 1: Phrase-level chunking
+Identify multi-word structures and treat them as a single unit BEFORE analyzing individual words:
+- Auxiliary chains: "ist gegangen", "hat gemacht", "wird kommen", "war gewesen", "sind worden" → mark the entire chain as auxiliary, drop the auxiliary (sein/haben/werden), keep only the participle/infinitive lemma
+- Modal + infinitive: "kann gehen", "muss machen", "soll bleiben" → keep the modal only if it carries meaning (kann=ability, muss=obligation), keep the main verb
+- Reflexive constructions: "sich freuen", "sich ärgern" → drop "sich" (reflexive marker), keep the verb
+- Particle verbs: "aufstehen", "ankommen", "wegfahren" → keep as one unit (already a single lemma)
+- Light verb constructions: "Bescheid geben"→"geben/inform", "in Verbindung treten"→"verbinden" — collapse to a single content word
+- Discourse frames: "und nun", "weiß ich nicht", "denke ich" → drop the frame, keep the proposition
+
+## Step 2: Decide which units determine the core meaning
+Keep words that would be produced as an independent sign in DGS:
+- Content words: nouns (Wetter, Regen), verbs (gehen, regnen, sein-as-existence), adjectives (warm, kalt), content adverbs (heute, morgen, oft)
+- Pronouns: ich, du, er, sie, wir, ihr, mein, dein, sein, unser — DGS expresses these via IX (indexing) and POSS signs
+- Negations: nicht, nie, niemals, kein, keine, nichts, niemand, weder, ohne
+- Interrogative WH-words: was, wann, wo, wer, warum, wie, welcher
+- Numbers and quantifiers: ein/eine (when meaning "one", not as article), zwei, drei, viele, wenige, alle
+- Modal verbs that carry meaning: kann (ability), muss/soll (obligation), darf (permission), will (desire)
+- Spatial/directional words: oben, unten, hier, dort, vor, hinter, rechts, links — when expressing location
+- Time expressions: heute, morgen, gestern, jetzt, bald, früh, spät
+
+Drop words that don't change the core meaning:
+- Articles: der, die, das, den, dem, des, ein, eine, einen, einer, eines (when used as articles, not numerals)
+- Copulas / structural sein: ist, sind, war, waren, sei, gewesen — when linking ("ist warm" → just "warm")
+- Auxiliary chains identified in Step 1: haben + Partizip, werden + Infinitiv (future)
+- Conjunctions: und, oder, aber, denn, weil, dass, obwohl, wenn, falls, sondern
+- Structural prepositions: in, auf, an, von, mit, für, bei, zu, nach (when grammatical/structural)
+- Degree modifiers: sehr, ziemlich, ganz, recht, durchaus — DGS expresses degree via sign intensity, not separate signs
+- Discourse fillers: also, eigentlich, halt, eben, mal, doch, ja, schon, nun
+- Vague quantifiers / particles: etwas, irgendwie, sozusagen
+- Impersonal "es": "es regnet" → just "regnen"; "es gibt" → "geben/exist"
+- Filler relative pronouns: der/die/das as relative pronouns introducing subordinate clauses
+
+If the same content repeats for emphasis in the original sentence, keep it only once (de-duplicate).
+
+## Step 3: Restore to citation form (German lemmatization)
+Lemmatize each kept word to its base/dictionary form:
+- Verb conjugation: gehe/gehst/geht/gingen→gehen; regnet/regnete→regnen; bin/bist/ist/war→sein
+- Plural: Tagen→Tag; Wolken→Wolke; Häuser→Haus; Männer→Mann
+- Adjective inflection: tiefer/tiefen/tieferes→tief; kräftige/kräftigen→kräftig; nächsten→nächst
+- Comparative/superlative: höher→hoch; größer→groß; am besten→gut
+- Decapitalize all words. DGS gloss is conventionally upper-case, but for our pipeline we output lowercase for tokenizer compatibility.
+
+## Output format
+Output ONLY the pseudo-gloss as a single line of space-separated lowercase words. No explanation. No quotation marks. No leading punctuation.
+
+## Examples
+
+Sentence: warum?
+Gloss: warum
+
+Sentence: ich freue mich.
+Gloss: ich freuen
+
+Sentence: und nun die wettervorhersage für morgen donnerstag den zwölften august
+Gloss: wettervorhersage morgen donnerstag zwölft august
+
+Sentence: tiefer luftdruck bestimmt in den nächsten tagen unser wetter
+Gloss: tief luftdruck bestimmen nächst tag unser wetter
+
+Sentence: im nordwesten bleibt es heute nacht meist trocken sonst muss mit teilweise kräftigen schauern gerechnet werden
+Gloss: nordwesten bleiben heute nacht trocken muss kräftig schauer rechnen
+
+Sentence: mancherorts regnet es auch länger und ergiebig auch lokale überschwemmungen sind wieder möglich
+Gloss: mancherorts regnen lang ergiebig lokal überschwemmung möglich
+
+Sentence: was ist mit dem wetter morgen?
+Gloss: was wetter morgen
+
+Now extract the pseudo-gloss for the following German sentence.
+
+Sentence: {input_sentence}
+Gloss:
