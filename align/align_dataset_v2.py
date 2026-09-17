@@ -42,6 +42,7 @@ def load_chunks(chunk_dir):
                         if l.strip():
                             r = json.loads(l); u = r.get('chunks') or r.get('gloss')
                             if u: h2c[r['h']] = u
+                            if 'gloss' in r: h2c['__gloss__'] = True  # marker: units are already sign-level, skip stopword merging
     return h2c
 
 
@@ -68,7 +69,7 @@ class ClipAlignDataset(Dataset):
             if not t or not ss or not os.path.exists(tok): continue
             ch = h2c.get(hashlib.md5(t.encode()).hexdigest())
             if not ch: ch = [t]; n_fallback += 1
-            else: ch = merge_stopword_chunks(ch)
+            elif not h2c.get('__gloss__'): ch = merge_stopword_chunks(ch)  # gloss units keep pronouns/negation as their own signs
             self.items.append((tok, ch[:max_chunks], ss[:max_segs]))
             if max_items and len(self.items) >= max_items: break
         self.max_tok, self.train = max_tok, train
