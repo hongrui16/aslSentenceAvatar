@@ -65,7 +65,7 @@ def main():
     def label(seg_idx):
         sim = EA[seg_idx].float() @ G.T; cos, g = sim.max(1); return [uniq[int(k)] if float(cv) >= a.min_cos else None for cv, k in zip(cos, g)]
     h2c = load_chunks(f'{DR}/{a.units}'); rng = np.random.default_rng(a.seed)
-    rec, prec, rec_r, prec_r, n_gt, n_used = [], [], [], [], [], 0; per_corpus = {}
+    rec, prec, rec_r, prec_r, n_gt, n_used = [], [], [], [], [], 0; per_corpus = {}; n_ret, n_ret_lab = [], []
     for cid in wanted:
         video, npz, text, co = rows[cid]; g_gt = gt.get(cid)
         if not g_gt: continue
@@ -73,11 +73,11 @@ def main():
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16): zt = model.embed_chunks(u, dev).half()
         sim = (zt @ E.T).float(); sim[:, torch.from_numpy(seg_video == video).to(dev)] = -1e4; top = sim.argmax(-1)
         rnd = torch.from_numpy(rng.choice(len(E), size=len(top))).to(dev)
-        lab, lab_r = [g for g in label(top) if g], [g for g in label(rnd) if g]
+        lab, lab_r = [g for g in label(top) if g], [g for g in label(rnd) if g]; n_ret.append(len(top)); n_ret_lab.append(len(lab))
         S = set(g_gt); R, RR = set(lab), set(lab_r)
         rec.append(len(S & R) / len(S)); prec.append(len(S & R) / max(len(R), 1)); rec_r.append(len(S & RR) / len(S)); prec_r.append(len(S & RR) / max(len(RR), 1))
         n_gt.append(len(S)); n_used += 1; per_corpus.setdefault(co, []).append(rec[-1])
-    out = {'n_clips_with_gt_glosses': n_used, 'mean_gt_glosses': float(np.mean(n_gt)), 'units': a.units, 'bank_dir': a.bank_dir,
+    out = {'n_clips_with_gt_glosses': n_used, 'mean_gt_glosses': float(np.mean(n_gt)), 'mean_retrieved': float(np.mean(n_ret)), 'mean_retrieved_labelled': float(np.mean(n_ret_lab)), 'units': a.units, 'bank_dir': a.bank_dir, 'val_spots': a.val_spots,
            'recall': float(np.mean(rec)), 'precision': float(np.mean(prec)), 'recall_random': float(np.mean(rec_r)), 'precision_random': float(np.mean(prec_r)),
            'lift_recall': float(np.mean(rec) / max(np.mean(rec_r), 1e-9)), 'per_corpus_recall': {k: float(np.mean(v)) for k, v in per_corpus.items()}}
     print(json.dumps(out, indent=1)); os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True); json.dump(out, open(a.out, 'w'), indent=1)
