@@ -34,7 +34,7 @@ def main():
     ap.add_argument('--units', choices=['chunks', 'gloss'], required=True); ap.add_argument('--out', required=True)
     ap.add_argument('--val_list', default='/home/rhong5/research_pro/hand_modeling_pro/asl_data_curation/data_records/curation/subsets/pool_val.txt')
     ap.add_argument('--val_spots', default=f'{DR}/val_spots_v4_anchor.tsv'); ap.add_argument('--n_clips', type=int, default=400); ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--min_cos', type=float, default=0.4)
+    ap.add_argument('--min_cos', type=float, default=0.4); ap.add_argument('--judge_ckpt', default=ANCHOR); ap.add_argument('--judge_bank', default=ANCHOR_BANK); ap.add_argument('--judge_sb', default=f'{DR}/signbank_tokens.npz')
     a = ap.parse_args(); random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed); dev = 'cuda'
     rows = {}
     with open(INDEX) as f:
@@ -49,10 +49,10 @@ def main():
     model = AlignModel(c['mmm_ckpt'], c['text_encoder'], c['e']).to(dev); model.load_state_dict(ck['model']); model.eval()
     E, meta, cids = load_bank(a.bank_dir, dev); seg_video = np.array([rows[cids[i]][0] if cids[i] in rows else '?' for i in meta[:, 0]])
     # fixed spotter: anchor model's bank embeddings (same segment order as any bank built from pretrain_all) + gloss vectors
-    ck2 = torch.load(ANCHOR, map_location='cpu'); c2 = ck2['config']
+    ck2 = torch.load(a.judge_ckpt, map_location='cpu'); c2 = ck2['config']
     anchor = AlignModel(c2['mmm_ckpt'], c2['text_encoder'], c2['e']).to(dev); anchor.load_state_dict(ck2['model']); anchor.eval()
-    EA, metaA, cidsA = load_bank(ANCHOR_BANK, dev); assert len(EA) == len(E) and cidsA == cids, 'banks must share segment order'
-    sb = SignBank(f'{DR}/signbank_tokens.npz', f'{DR}/signbank_split.json', anchor.mmm.pos.num_embeddings)
+    EA, metaA, cidsA = load_bank(a.judge_bank, dev); assert len(EA) == len(E) and cidsA == cids, 'banks must share segment order'
+    sb = SignBank(a.judge_sb, f'{DR}/signbank_split.json', anchor.mmm.pos.num_embeddings)
     Z, texts = [], [sb.texts[i] for i in range(len(sb.stems))]
     with torch.no_grad():
         for i in range(0, len(sb.stems), 128):
@@ -77,7 +77,7 @@ def main():
         S = set(g_gt); R, RR = set(lab), set(lab_r)
         rec.append(len(S & R) / len(S)); prec.append(len(S & R) / max(len(R), 1)); rec_r.append(len(S & RR) / len(S)); prec_r.append(len(S & RR) / max(len(RR), 1))
         n_gt.append(len(S)); n_used += 1; per_corpus.setdefault(co, []).append(rec[-1])
-    out = {'n_clips_with_gt_glosses': n_used, 'mean_gt_glosses': float(np.mean(n_gt)), 'mean_retrieved': float(np.mean(n_ret)), 'mean_retrieved_labelled': float(np.mean(n_ret_lab)), 'units': a.units, 'bank_dir': a.bank_dir, 'val_spots': a.val_spots,
+    out = {'n_clips_with_gt_glosses': n_used, 'mean_gt_glosses': float(np.mean(n_gt)), 'mean_retrieved': float(np.mean(n_ret)), 'mean_retrieved_labelled': float(np.mean(n_ret_lab)), 'units': a.units, 'bank_dir': a.bank_dir, 'val_spots': a.val_spots, 'judge_ckpt': a.judge_ckpt,
            'recall': float(np.mean(rec)), 'precision': float(np.mean(prec)), 'recall_random': float(np.mean(rec_r)), 'precision_random': float(np.mean(prec_r)),
            'lift_recall': float(np.mean(rec) / max(np.mean(rec_r), 1e-9)), 'per_corpus_recall': {k: float(np.mean(v)) for k, v in per_corpus.items()}}
     print(json.dumps(out, indent=1)); os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True); json.dump(out, open(a.out, 'w'), indent=1)
