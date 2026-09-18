@@ -1,4 +1,5 @@
-"""Aligner v4 = v1 MIL-NCE + phrase-level supervision levers (track A of the 2026-09-16 decision).
+"""Aligner v7 (2026-09-18) = v4 recipe (MIL + SignBank anchor + spotting hard pairs [+ mono]) on GLOSS text units (align_dataset_v2,
+--chunk_dir gloss). Init from the g1 checkpoint. v4 file untouched.
 
 Fine-tunes from an existing AlignModel checkpoint (--init_ckpt) with the same data/collate as train_align.py and adds:
   --anchor_w  SignBank gloss anchor: each step samples --anchor_bs citation signs (train split of
@@ -173,7 +174,7 @@ def spot_loss(sim, pairs, scale):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tok_dir', default='/projects/kosecka/hongrui/dataset/smplx_fits/pooled_tokens/vq_K512_w64')
-    ap.add_argument('--chunk_dir', default=f'{DR}/chunks'); ap.add_argument('--init_ckpt', required=True)
+    ap.add_argument('--chunk_dir', default=f'{DR}/gloss'); ap.add_argument('--init_ckpt', required=True)
     ap.add_argument('--train_list', default=f'{SUB}/pretrain_all.txt'); ap.add_argument('--val_list', default=f'{SUB}/pool_val.txt')
     ap.add_argument('--sb_npz', default=f'{DR}/signbank_tokens.npz'); ap.add_argument('--sb_split', default=f'{DR}/signbank_split.json')
     ap.add_argument('--anchor_w', type=float, default=0.0); ap.add_argument('--anchor_bs', type=int, default=64)
@@ -182,7 +183,7 @@ def main():
     ap.add_argument('--batch_size', type=int, default=48); ap.add_argument('--steps', type=int, default=30000)
     ap.add_argument('--lr', type=float, default=5e-5); ap.add_argument('--lr_text', type=float, default=1e-5); ap.add_argument('--warmup', type=int, default=500)
     ap.add_argument('--val_every', type=int, default=2000); ap.add_argument('--workers', type=int, default=8); ap.add_argument('--max_items', type=int, default=0)
-    ap.add_argument('--out_dir', default='/scratch/rhong5/weights/temp_training_weights/aslSentenceAvatar/Align_Pooled'); ap.add_argument('--tag', default='align_v4'); ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--out_dir', default='/scratch/rhong5/weights/temp_training_weights/aslSentenceAvatar/Align_Pooled'); ap.add_argument('--tag', default='align_v7'); ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args(); torch.manual_seed(a.seed); random.seed(a.seed); rng = random.Random(a.seed); dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     run = f"{time.strftime('%Y%m%d_%H%M%S')}_job{os.environ.get('SLURM_JOB_ID', 'local')}_{a.tag}"; ckdir = os.path.join(a.out_dir, run); logdir = os.path.join(_repo, 'zlog', 'Align_Pooled', run)
     os.makedirs(ckdir, exist_ok=True); os.makedirs(logdir, exist_ok=True); json.dump(vars(a), open(os.path.join(logdir, 'config.json'), 'w'), indent=1)
